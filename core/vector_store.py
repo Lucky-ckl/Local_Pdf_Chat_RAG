@@ -10,8 +10,27 @@
 """
 
 import logging
+import os
+import json
+from datetime import datetime, timezone
 import numpy as np
+import faiss
 from faiss import IndexFlatL2, IndexIVFFlat, IndexIVFPQ
+
+
+# 持久化文件与 manifest 版本（P2.1，缺陷 D4：索引原为纯内存，重启即丢）。
+FAISS_FILENAME = "faiss.index"
+CHUNKS_FILENAME = "chunks.json"
+MANIFEST_FILENAME = "manifest.json"
+MANIFEST_VERSION = 1
+
+
+class IndexPersistenceError(Exception):
+    """索引持久化 / 加载相关错误的基类。"""
+
+
+class IndexConfigMismatchError(IndexPersistenceError):
+    """持久化索引的 manifest 与当前配置不一致；加载被显式拒绝，需重建索引。"""
 
 
 class AutoFaissIndex:
@@ -177,6 +196,185 @@ class VectorStore:
         self.id_order.clear()
         logging.info("向量存储已清空")
 
+    def save(self, index_dir):
+        """把 FAISS 索引与 chunk 元数据落盘到 ``index_dir``（P2.1）。
+
+        - ``faiss.index``：FAISS 原生二进制（``faiss.write_index``）
+        - ``chunks.json``：contents / metadatas / id_order 及索引类型参数
+        - ``manifest.json``：embedding 模型名、chunk 参数、构建时间与块数（加载时用于一致性校验）
+
+        返回是否写入成功；索引为空时不落盘。
+        """
+        if not self.is_ready:
+            logging.warning("向量索引为空，跳过持久化")
+            return False
+        from config import CHUNK_SIZE, CHUNK_OVERLAP
+        from core.embeddings import EMBED_MODEL_NAME
+        try:
+            os.makedirs(index_dir, exist_ok=True)
+            faiss.write_index(self.index.index, os.path.join(index_dir, FAISS_FILENAME))
+            payload = {
+                "version": 1,
+                "contents": self.contents_map,
+                "metadatas": self.metadatas_map,
+                "id_order": self.id_order,
+                "faiss_params": {
+                    "index_type": self.index.index_type,
+                    "dimension": self.index.dimension,
+                    "nlist": self.index.nlist,
+                    "m": self.index.m,
+                    "nprobe": self.index.nprobe,
+                },
+            }
+            with open(os.path.join(index_dir, CHUNKS_FILENAME), "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+            manifest = {
+                "version": MANIFEST_VERSION,
+                "embedding_model": EMBED_MODEL_NAME,
+                "chunk_size": CHUNK_SIZE,
+                "chunk_overlap": CHUNK_OVERLAP,
+                "num_chunks": self.total_chunks,
+                "faiss_index_type": self.index.index_type,
+                "built_at": datetime.now(timezone.utc).isoformat(),
+            }
+            with open(os.path.join(index_dir, MANIFEST_FILENAME), "w", encoding="utf-8") as f:
+                json.dump(manifest, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logging.error("向量索引持久化失败: %s", e)
+            return False
+        logging.info(
+            "FAISS 索引已持久化: %s（%d 个文本块）",
+            os.path.join(index_dir, FAISS_FILENAME), self.total_chunks,
+        )
+        return True
+
+    def load(self, index_dir):
+        """从 ``index_dir`` 加载持久化索引（P2.1）。
+
+        - 成功返回 ``True``；
+        - 文件缺失 / 结构损坏 / 解析失败：清空并返回 ``False``（进入明确的空索引未就绪状态，
+          不得伪装成加载成功）；
+        - manifest 与当前配置不一致：抛 ``IndexConfigMismatchError``，显式拒绝加载过期索引。
+        """
+        self.clear()
+        faiss_path = os.path.join(index_dir, FAISS_FILENAME)
+        chunks_path = os.path.join(index_dir, CHUNKS_FILENAME)
+        manifest_path = os.path.join(index_dir, MANIFEST_FILENAME)
+
+        if not (os.path.exists(faiss_path) and os.path.exists(chunks_path)
+                and os.path.exists(manifest_path)):
+            logging.warning("未找到完整索引文件，进入空索引状态（索引未就绪）: %s", index_dir)
+            return False
+
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                manifest = json.load(f)
+        except Exception as e:
+            logging.error("manifest.json 解析失败（索引损坏），进入空索引状态: %s", e)
+            return False
+
+        # 一致性校验：不匹配则显式拒绝（不静默加载过期索引）
+        self._validate_manifest(manifest)
+
+        try:
+            faiss_index = faiss.read_index(faiss_path)
+            with open(chunks_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            params = payload.get("faiss_params", {})
+            auto_index = AutoFaissIndex(dimension=params.get("dimension", faiss_index.d))
+            auto_index.index = faiss_index
+            auto_index.index_type = params.get("index_type")
+            auto_index.nlist = params.get("nlist")
+            auto_index.m = params.get("m")
+            auto_index.nprobe = params.get("nprobe", 1)
+            self.index = auto_index
+            self.contents_map = payload["contents"]
+            self.metadatas_map = payload["metadatas"]
+            self.id_order = payload["id_order"]
+        except Exception as e:
+            logging.error("索引文件读取失败（索引损坏），进入空索引状态: %s", e)
+            self.clear()
+            return False
+
+        logging.info("FAISS 索引已从磁盘加载: %d 个文本块", self.total_chunks)
+        return True
+
+    @staticmethod
+    def _validate_manifest(manifest):
+        """比对 manifest 的分块参数与 embedding 模型名与当前配置；不一致即抛异常。"""
+        from config import CHUNK_SIZE, CHUNK_OVERLAP
+        from core.embeddings import EMBED_MODEL_NAME
+
+        expected = {
+            "chunk_size": CHUNK_SIZE,
+            "chunk_overlap": CHUNK_OVERLAP,
+            "embedding_model": EMBED_MODEL_NAME,
+        }
+        mismatches = []
+        for key, current in expected.items():
+            saved = manifest.get(key)
+            if saved != current:
+                mismatches.append(f"{key}: 索引={saved!r} 当前={current!r}")
+        if mismatches:
+            message = (
+                "持久化索引与当前配置不匹配，已拒绝加载（请重建索引）: "
+                + "; ".join(mismatches)
+            )
+            logging.error(message)
+            raise IndexConfigMismatchError(message)
+
 
 # 模块级单例
 vector_store = VectorStore()
+
+
+def save_persisted_index(index_dir=None):
+    """保存 FAISS + BM25 + chunk 元数据 + manifest 到 ``INDEX_DIR``（P2.1）。
+
+    顺序：先落 FAISS 索引 + chunk 元数据 + manifest（``vector_store.save``），再落 BM25
+    （``bm25_manager.save``）。返回是否成功。
+    """
+    from config import INDEX_DIR
+    from core.bm25_index import bm25_manager
+
+    target = index_dir or INDEX_DIR
+    if not vector_store.save(target):
+        return False
+    bm25_manager.save(target)
+    return True
+
+
+def load_persisted_index(index_dir=None):
+    """启动时加载持久化索引，返回状态字典 ``{"status", "message", "chunks"}``。
+
+    status 取值：
+    - ``"loaded"``   ：FAISS + BM25 均成功加载；
+    - ``"mismatch"`` ：manifest 与当前配置不一致，已显式拒绝加载（提示重建）；
+    - ``"not_ready"``：文件缺失或损坏，进入空索引状态。
+    """
+    from config import INDEX_DIR
+    from core.bm25_index import bm25_manager
+
+    target = index_dir or INDEX_DIR
+    try:
+        ok = vector_store.load(target)
+    except IndexConfigMismatchError as e:
+        bm25_manager.clear()
+        return {"status": "mismatch", "message": str(e), "chunks": 0}
+
+    if not ok:
+        bm25_manager.clear()
+        return {"status": "not_ready", "message": "索引未就绪（文件缺失或损坏）", "chunks": 0}
+
+    if not bm25_manager.load(target, contents_by_id=vector_store.contents_map):
+        # 文件缺失或损坏导致 BM25 未能重建：整体进入未就绪，不得伪装成加载成功
+        logging.error("BM25 索引加载失败，索引整体进入未就绪状态")
+        vector_store.clear()
+        bm25_manager.clear()
+        return {"status": "not_ready", "message": "索引未就绪（BM25 索引缺失或损坏）", "chunks": 0}
+
+    return {
+        "status": "loaded",
+        "message": f"索引已加载，共 {vector_store.total_chunks} 个文本块",
+        "chunks": vector_store.total_chunks,
+    }

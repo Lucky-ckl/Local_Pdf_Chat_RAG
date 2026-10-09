@@ -32,7 +32,7 @@ from config import (
 from core.document_loader import extract_text
 from core.text_splitter import split_text
 from core.embeddings import encode_texts, EMBED_MODEL_NAME
-from core.vector_store import vector_store
+from core.vector_store import vector_store, save_persisted_index, load_persisted_index
 from core.bm25_index import bm25_manager
 from core.generator import query_answer, call_siliconflow_api, call_magick_api
 
@@ -92,6 +92,13 @@ def process_multiple_files(files, progress=gr.Progress()):
 
         progress(0.95, desc="构建BM25检索索引...")
         bm25_manager.build_index(all_chunks, all_ids)
+
+        if all_chunks:
+            progress(0.98, desc="持久化索引...")
+            if save_persisted_index():
+                processed_results.append("💾 索引已持久化，重启后无需重建")
+            else:
+                processed_results.append("⚠️ 索引持久化失败（本次仍可在当前进程内检索）")
 
         summary = f"\n总计处理 {total_files} 个文件，{len(all_chunks)} 个文本块"
         processed_results.append(summary)
@@ -197,6 +204,35 @@ def get_model_display_name(model_choice_val):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 索引持久化状态（P2.1）
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 最近一次索引加载状态；由 refresh_index_state() 在启动 / 页面加载时刷新。
+INDEX_STATE = {"status": "unknown", "message": "", "chunks": 0}
+
+
+def get_index_status_markdown(state=None):
+    """把索引加载状态渲染为明确的 UI 文案（就绪 / 未就绪 / 配置不匹配）。"""
+    if state is None:
+        state = INDEX_STATE
+    status = state.get("status")
+    if status == "loaded":
+        return f"✅ 索引已就绪：{state.get('message')}"
+    if status == "mismatch":
+        return f"❌ 索引未就绪（配置不匹配，请重建索引）：{state.get('message')}"
+    if status == "not_ready":
+        return "⚠️ 索引未就绪：请先上传并处理文档"
+    return "ℹ️ 索引状态：未检查"
+
+
+def refresh_index_state():
+    """启动时加载持久化索引，刷新 UI 索引状态。返回状态 Markdown。"""
+    global INDEX_STATE
+    INDEX_STATE = load_persisted_index()
+    logging.info("索引状态: %s - %s", INDEX_STATE.get("status"), INDEX_STATE.get("message"))
+    return get_index_status_markdown(INDEX_STATE)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Gradio UI（Gradio 6.x 兼容）
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 CSS = """
@@ -256,6 +292,7 @@ with gr.Blocks(title="本地RAG问答系统") as demo:
                         upload_btn = gr.Button("🚀 开始处理", variant="primary")
                         upload_status = gr.Textbox(label="处理状态", interactive=False, lines=2)
                         file_list = gr.Textbox(label="已处理文件", interactive=False, lines=3, elem_classes="file-list")
+                        index_status = gr.Markdown("ℹ️ 索引状态：未检查")
 
                     gr.Markdown("## ❓ 输入问题")
                     with gr.Group():
@@ -442,6 +479,7 @@ with gr.Blocks(title="本地RAG问答系统") as demo:
         vector_db_value, vector_db_info, log_display
     ])
     clear_logs_btn.click(fn=lambda: "<div style='color:#4CAF50'>日志已清空</div>", outputs=[log_display])
+    demo.load(fn=refresh_index_state, outputs=[index_status])
     theme_btn.click(fn=toggle_theme, inputs=[], outputs=[], js="""
         () => {
             document.querySelector('body').classList.toggle('dark');
@@ -496,6 +534,9 @@ def check_environment():
 if __name__ == "__main__":
     if not check_environment():
         exit(1)
+
+    # P2.1：启动时加载已持久化的索引（无需重新灌库）
+    refresh_index_state()
 
     ports = [17995, 17996, 17997, 17998, 17999]
     selected_port = next((p for p in ports if is_port_available(p)), None)

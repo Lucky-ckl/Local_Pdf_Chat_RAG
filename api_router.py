@@ -16,7 +16,7 @@ from version import __version__
 # 从重构后的模块导入
 from config import SILICONFLOW_API_KEY, MAGICK_API_KEY, is_configured_api_key
 from core.generator import query_answer
-from core.vector_store import vector_store
+from core.vector_store import vector_store, load_persisted_index
 from features.web_search import check_serpapi_key
 from utils.network import is_port_available
 
@@ -35,9 +35,16 @@ class ProgressCallback:
         return self
 
 
+INDEX_STATE = {"status": "unknown", "message": "", "chunks": 0}
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("API 服务启动")
+    # P2.1：启动时加载已持久化的索引（无需重新灌库）
+    global INDEX_STATE
+    INDEX_STATE = load_persisted_index()
+    logger.info("索引状态: %s - %s", INDEX_STATE.get("status"), INDEX_STATE.get("message"))
     yield
     logger.info("API 服务已关闭")
 
@@ -137,6 +144,9 @@ async def check_status():
         "serpapi_configured": check_serpapi_key(),
         "vector_store_ready": vector_store.is_ready,
         "total_chunks": vector_store.total_chunks,
+        "index_ready": vector_store.is_ready,
+        "index_status": INDEX_STATE.get("status"),
+        "index_message": INDEX_STATE.get("message"),
         "version": __version__
     }
 
