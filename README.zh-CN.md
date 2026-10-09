@@ -6,11 +6,8 @@
 
 [English](README.md) | 简体中文
 
-[![CI](https://github.com/weiwill88/Local_Pdf_Chat_RAG/actions/workflows/ci.yml/badge.svg)](https://github.com/weiwill88/Local_Pdf_Chat_RAG/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
-[![Release](https://img.shields.io/github/v/release/weiwill88/Local_Pdf_Chat_RAG)](https://github.com/weiwill88/Local_Pdf_Chat_RAG/releases)
-[![Stars](https://img.shields.io/github/stars/weiwill88/Local_Pdf_Chat_RAG?style=social)](https://github.com/weiwill88/Local_Pdf_Chat_RAG/stargazers)
 
 </div>
 
@@ -18,30 +15,33 @@ Local PDF Chat RAG 面向希望理解检索增强生成完整链路的开发者�
 
 > 本仓库是教学与实验用途的参考实现，不是开箱即用的生产级知识库服务。用于真实业务前，请补充身份鉴权、租户隔离、持久化、评测、安全审计和部署治理。
 
+## Fork 来源与改造说明
+
+本仓库 **Fork 自** [`weiwill88/Local_Pdf_Chat_RAG`](https://github.com/weiwill88/Local_Pdf_Chat_RAG)。上游项目为教学型参考实现，其原始代码归属上游作者。
+
+本 Fork 计划的改造内容（**已勾选项已实现；其余尚未实现**）：
+
+- [x] 修复失效的重排序（改用真正的 CrossEncoder，并让降级可见）
+- [x] 让混合检索分数可信（对真实距离/相似度做归一化）
+- [ ] 增加扫描件 OCR（文本层 / OCR 双路径）
+- [ ] 索引持久化，重启不丢失
+- [ ] 真正的多轮对话与真实流式输出（SSE）
+- [ ] 重写前端（FastAPI + 原生单页，含检索过程面板）
+- [ ] 建立评测体系（检索指标与改造前后对比）
+
+> 总体依据为项目 WBS；仅上述已勾选项已实现，其余当前**尚未实现**。P1 验收记录见 `docs/decisions.md` §7。
+
 ![Local PDF Chat RAG 当前界面](images/demo-current.png)
 
-## 使用与维护情况
+## 上游项目（来源参考）
 
-截至 **2026-08-31** 的仓库快照：
-
-| 指标 | 可核验数据 |
-| --- | --- |
-| 项目采用 | [951 Stars](https://github.com/weiwill88/Local_Pdf_Chat_RAG/stargazers)、[179 Forks](https://github.com/weiwill88/Local_Pdf_Chat_RAG/forks) |
-| 近期 GitHub 流量 | 最近 14 天（截至 2026-08-30）有 105 位独立访客、78 位独立克隆者 |
-| 发布记录 | [已发布 2 个版本](https://github.com/weiwill88/Local_Pdf_Chat_RAG/releases)，当前版本为 [`v2.1.0`](https://github.com/weiwill88/Local_Pdf_Chat_RAG/releases/tag/v2.1.0) |
-| 维护频率 | [最近 90 天有 5 个提交](https://github.com/weiwill88/Local_Pdf_Chat_RAG/commits/main/)，最近一次 `main` 更新为 2026-08-16 |
-| 持续集成 | [最近一次 `main` CI 已通过](https://github.com/weiwill88/Local_Pdf_Chat_RAG/actions/workflows/ci.yml)，Pull Request 会执行源码编译和无密钥测试 |
-| Issue 与 PR 处理 | [38 个 Issue 已关闭](https://github.com/weiwill88/Local_Pdf_Chat_RAG/issues?q=is%3Aissue+state%3Aclosed)、[0 个待处理](https://github.com/weiwill88/Local_Pdf_Chat_RAG/issues?q=is%3Aissue+state%3Aopen)；[9 个 PR 已合并](https://github.com/weiwill88/Local_Pdf_Chat_RAG/pulls?q=is%3Apr+is%3Amerged)、[1 个正在 Review](https://github.com/weiwill88/Local_Pdf_Chat_RAG/pulls?q=is%3Apr+state%3Aopen) |
-
-近期维护工作包括 Review 并合并[外部贡献者提交的检索修复](https://github.com/weiwill88/Local_Pdf_Chat_RAG/pull/55)、发布双语文档、增加无密钥测试和 GitHub Actions CI、采用 MIT License，以及建立非公开安全问题报告流程。
-
-Stars、Forks 和流量均为注明日期的 GitHub 快照。流量与克隆数据反映仓库关注度，不代表已经核验的安装用户或生产部署。当前状态请以仓库、[Actions](https://github.com/weiwill88/Local_Pdf_Chat_RAG/actions) 和 [Releases](https://github.com/weiwill88/Local_Pdf_Chat_RAG/releases) 页面为准。
+此处原先列出的 Star、提交、发布与维护数据描述的是**上游**项目 [`weiwill88/Local_Pdf_Chat_RAG`](https://github.com/weiwill88/Local_Pdf_Chat_RAG)，并非本 Fork 的数据，且均为注明日期的快照。当前上游状态请以其[仓库](https://github.com/weiwill88/Local_Pdf_Chat_RAG)、[Actions](https://github.com/weiwill88/Local_Pdf_Chat_RAG/actions) 与 [Releases](https://github.com/weiwill88/Local_Pdf_Chat_RAG/releases) 页面为准。
 
 ## 项目特点
 
 - **链路透明**：核心步骤按 RAG 执行顺序拆分，便于学习和调试。
-- **混合检索**：结合 FAISS 向量检索和 BM25 关键词检索。
-- **可选重排序**：支持 CrossEncoder 或基于模型的相关性评分。
+- **混合检索**：结合 FAISS 向量检索和 BM25 关键词检索；语义分数由真实 FAISS 距离归一化得到（`sim(d)=1/(1+max(d,0))`），而非排名序位。
+- **重排序**：使用真正的交叉编码器（CrossEncoder），模型名取自 `config.RERANK_MODEL_NAME`（默认 `BAAI/bge-reranker-base`）。重排失败不再静默：重排不可用（或经 `RERANK_METHOD=none` 关闭）时降级为 RRF 融合，并通过 `score_source`/状态字段与日志体现。见 `docs/baseline-defects.md` D1（已修复）与 `docs/decisions.md` §7。已知限制：默认模型尚未在本环境完成真实加载验证。
 - **多模型后端**：支持本地 Ollama、SiliconFlow 以及 OpenAI-compatible API。
 - **多种文档格式**：支持 PDF、TXT、Markdown、DOCX、XLS/XLSX 和 PPTX。
 - **双入口**：提供 Gradio Web UI 和 FastAPI REST API。
@@ -180,8 +180,8 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest
 ## 版本与维护
 
 - 变更记录：[`CHANGELOG.md`](CHANGELOG.md)
-- 已发布版本：[GitHub Releases](https://github.com/weiwill88/Local_Pdf_Chat_RAG/releases)
-- 当前维护者：[Will Wei](https://github.com/weiwill88)
+- 上游发布：[GitHub Releases](https://github.com/weiwill88/Local_Pdf_Chat_RAG/releases)（属上游 `weiwill88/Local_Pdf_Chat_RAG`；本 Fork 暂无发布）
+- 上游维护者：[Will Wei](https://github.com/weiwill88)
 
 ## 许可证
 

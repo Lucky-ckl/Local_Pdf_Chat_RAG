@@ -6,11 +6,8 @@ A transparent, runnable Python implementation for learning and inspecting RAG
 
 English | [简体中文](README.zh-CN.md)
 
-[![CI](https://github.com/weiwill88/Local_Pdf_Chat_RAG/actions/workflows/ci.yml/badge.svg)](https://github.com/weiwill88/Local_Pdf_Chat_RAG/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
-[![Release](https://img.shields.io/github/v/release/weiwill88/Local_Pdf_Chat_RAG)](https://github.com/weiwill88/Local_Pdf_Chat_RAG/releases)
-[![Stars](https://img.shields.io/github/stars/weiwill88/Local_Pdf_Chat_RAG?style=social)](https://github.com/weiwill88/Local_Pdf_Chat_RAG/stargazers)
 
 </div>
 
@@ -18,30 +15,33 @@ Local PDF Chat RAG is an educational and reference implementation for developers
 
 > This repository is intended for learning and experimentation. It is not a production-ready knowledge-base service. Add authentication, tenant isolation, persistence, evaluation, security controls, and deployment governance before using it with real business data.
 
+## Fork and modification notice
+
+This repository is a **fork** of [`weiwill88/Local_Pdf_Chat_RAG`](https://github.com/weiwill88/Local_Pdf_Chat_RAG). The upstream project is a teaching-oriented reference implementation; its original code remains credited to the upstream author.
+
+Planned changes in this fork (**checked items are implemented; everything else is not yet implemented**):
+
+- [x] Repair the ineffective reranker (real CrossEncoder via config; visible failure and RRF fallback)
+- [x] Make hybrid-retrieval scores meaningful (fuse normalized real FAISS distances)
+- [ ] Add scanned-PDF OCR (text-layer vs. OCR dual path)
+- [ ] Persist the index so it survives restarts
+- [ ] Implement real multi-turn conversation and true streaming (SSE)
+- [ ] Rewrite the frontend (FastAPI + native single page, including a retrieval-process panel)
+- [ ] Build an evaluation harness (retrieval metrics and before/after comparison)
+
+> The authoritative plan of record is the project WBS. Only the checked items above are implemented; the rest are **not yet implemented**. See `docs/decisions.md` §7 for the P1 acceptance record.
+
 ![Current Local PDF Chat RAG interface](images/demo-current.png)
 
-## Usage and maintenance
+## Upstream project (reference)
 
-Repository snapshot as of **2026-08-31**:
-
-| Signal | Verifiable snapshot |
-| --- | --- |
-| Adoption | [951 stars](https://github.com/weiwill88/Local_Pdf_Chat_RAG/stargazers) and [179 forks](https://github.com/weiwill88/Local_Pdf_Chat_RAG/forks) |
-| Recent GitHub traffic | 105 unique visitors and 78 unique cloners in the latest 14-day window, through 2026-08-30 |
-| Release history | [2 published releases](https://github.com/weiwill88/Local_Pdf_Chat_RAG/releases); current version: [`v2.1.0`](https://github.com/weiwill88/Local_Pdf_Chat_RAG/releases/tag/v2.1.0) |
-| Maintenance activity | [5 commits in the last 90 days](https://github.com/weiwill88/Local_Pdf_Chat_RAG/commits/main/), with the latest `main` update on 2026-08-16 |
-| Continuous integration | [Latest `main` CI run passed](https://github.com/weiwill88/Local_Pdf_Chat_RAG/actions/workflows/ci.yml); source compilation and credential-free tests run on pull requests |
-| Issue and PR handling | [38 issues closed](https://github.com/weiwill88/Local_Pdf_Chat_RAG/issues?q=is%3Aissue+state%3Aclosed) and [0 open](https://github.com/weiwill88/Local_Pdf_Chat_RAG/issues?q=is%3Aissue+state%3Aopen); [9 pull requests merged](https://github.com/weiwill88/Local_Pdf_Chat_RAG/pulls?q=is%3Apr+is%3Amerged) and [1 under review](https://github.com/weiwill88/Local_Pdf_Chat_RAG/pulls?q=is%3Apr+state%3Aopen) |
-
-Recent maintenance includes reviewing and merging an [external retrieval fix](https://github.com/weiwill88/Local_Pdf_Chat_RAG/pull/55), publishing bilingual documentation, adding credential-free tests and GitHub Actions CI, adopting the MIT license, and documenting a private security-reporting process.
-
-Stars, forks, and traffic are dated GitHub snapshots. Traffic and clone counts indicate repository interest, not verified installations or production deployments. See the repository, [Actions](https://github.com/weiwill88/Local_Pdf_Chat_RAG/actions), and [Releases](https://github.com/weiwill88/Local_Pdf_Chat_RAG/releases) for the current state.
+The numbers, release history, and maintenance activity that were previously listed here describe the **upstream** project [`weiwill88/Local_Pdf_Chat_RAG`](https://github.com/weiwill88/Local_Pdf_Chat_RAG), not this fork, and were dated snapshots. For current upstream data, see the upstream [repository](https://github.com/weiwill88/Local_Pdf_Chat_RAG), [Actions](https://github.com/weiwill88/Local_Pdf_Chat_RAG/actions), and [Releases](https://github.com/weiwill88/Local_Pdf_Chat_RAG/releases).
 
 ## Why this project
 
 - **Inspectable pipeline**: core modules follow the order in which a RAG request is processed.
-- **Hybrid retrieval**: combines FAISS dense retrieval with BM25 keyword retrieval.
-- **Optional reranking**: supports a CrossEncoder or model-based relevance scoring.
+- **Hybrid retrieval**: combines FAISS dense retrieval with BM25 keyword retrieval; the semantic score is derived from normalized real FAISS distances (`sim(d)=1/(1+max(d,0))`) rather than from rank position.
+- **Reranking**: uses a real CrossEncoder whose model name comes from `config.RERANK_MODEL_NAME` (default `BAAI/bge-reranker-base`). Reranking failures are no longer silent: when the reranker is unavailable (or disabled via `RERANK_METHOD=none`), the request degrades to RRF fusion and the outcome is exposed through `score_source`/status fields and logs. See `docs/baseline-defects.md` D1 (fixed) and `docs/decisions.md` §7. Known limitation: the default model has not yet been load-verified in this environment.
 - **Multiple model backends**: local Ollama, SiliconFlow, and OpenAI-compatible APIs.
 - **Document support**: PDF, TXT, Markdown, DOCX, XLS/XLSX, and PPTX.
 - **Two interfaces**: a Gradio web application and a FastAPI REST API.
@@ -180,8 +180,8 @@ Do not open a public issue for a vulnerability. Follow [`SECURITY.md`](SECURITY.
 ## Releases and maintenance
 
 - Changelog: [`CHANGELOG.md`](CHANGELOG.md)
-- Releases: [GitHub Releases](https://github.com/weiwill88/Local_Pdf_Chat_RAG/releases)
-- Maintainer: [Will Wei](https://github.com/weiwill88)
+- Upstream releases: [GitHub Releases](https://github.com/weiwill88/Local_Pdf_Chat_RAG/releases) (upstream `weiwill88/Local_Pdf_Chat_RAG`; this fork has no releases yet)
+- Upstream maintainer: [Will Wei](https://github.com/weiwill88)
 
 ## License
 

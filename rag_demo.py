@@ -24,13 +24,14 @@ from datetime import datetime
 from config import (
     DEFAULT_MODEL_CHOICE, SILICONFLOW_API_KEY, MAGICK_API_KEY,
     OLLAMA_MODEL_NAME, SILICONFLOW_MODEL_NAME, MAGICK_MODEL_NAME,
-    MODEL_CHOICES, MODEL_DISPLAY_NAMES, is_configured_api_key
+    MODEL_CHOICES, MODEL_DISPLAY_NAMES, is_configured_api_key,
+    CHUNK_SIZE, CHUNK_OVERLAP, HYBRID_ALPHA, RERANK_METHOD, RERANK_MODEL_NAME
 )
 
 # 导入核心模块
 from core.document_loader import extract_text
 from core.text_splitter import split_text
-from core.embeddings import encode_texts
+from core.embeddings import encode_texts, EMBED_MODEL_NAME
 from core.vector_store import vector_store
 from core.bm25_index import bm25_manager
 from core.generator import query_answer, call_siliconflow_api, call_magick_api
@@ -78,9 +79,9 @@ def process_multiple_files(files, progress=gr.Progress()):
                 all_ids.extend(chunk_ids)
                 processed_results.append(f"✅ {file_name}: 成功处理 {len(chunks)} 个文本块")
 
-            except Exception as e:
-                logging.error(f"处理文件 {file_name} 时出错: {str(e)}")
-                processed_results.append(f"❌ {file_name}: 处理失败 - {str(e)}")
+            except Exception:
+                logging.exception(f"处理文件 {file_name} 时出错")
+                processed_results.append(f"❌ {file_name}: 处理失败")
 
         if all_chunks:
             progress(0.8, desc="生成文本嵌入...")
@@ -96,9 +97,9 @@ def process_multiple_files(files, progress=gr.Progress()):
         processed_results.append(summary)
         return "\n".join(processed_results), [f"📄 {os.path.basename(f.name)}" for f in files]
 
-    except Exception as e:
-        logging.error(f"处理过程出错: {str(e)}")
-        return f"处理过程出错: {str(e)}", []
+    except Exception:
+        logging.exception("处理过程出错")
+        return "处理过程出错", []
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -162,12 +163,27 @@ def show_chunk_details(evt: gr.SelectData):
 
 
 def get_system_models_info():
-    """返回系统使用的各种模型信息"""
+    """返回系统使用的各种模型信息。
+
+    P1.5：不再写死参数，改为读取当前进程实际生效的配置与运行时来源：
+    - 分块/混合权重：来自 config（CHUNK_SIZE / CHUNK_OVERLAP / HYBRID_ALPHA）。
+    - 嵌入模型：来自 core.embeddings.EMBED_MODEL_NAME（驱动实际加载，单一事实来源）。
+    - 重排序：来自 config.RERANK_METHOD / RERANK_MODEL_NAME，反映实际所用方法。
+    注意：config 在导入时读取 .env，故修改 .env 后需重启应用才会同步显示。
+    """
+    if RERANK_METHOD == "cross_encoder":
+        rerank_info = f"交叉编码器 ({RERANK_MODEL_NAME})"
+    elif RERANK_METHOD == "llm":
+        rerank_info = f"LLM 相关性评分 (Ollama: {OLLAMA_MODEL_NAME})"
+    elif RERANK_METHOD == "none":
+        rerank_info = "未启用（使用 RRF 融合排序）"
+    else:
+        rerank_info = f"未识别的方法 ({RERANK_METHOD})，运行时按服务不可用降级"
     return {
-        "嵌入模型": "all-MiniLM-L6-v2",
-        "分块方法": "RecursiveCharacterTextSplitter (chunk_size=400, overlap=40)",
-        "检索方法": "向量检索 + BM25混合检索 (α=0.7)",
-        "重排序模型": "交叉编码器 (distiluse-base-multilingual-cased-v2)",
+        "嵌入模型": EMBED_MODEL_NAME,
+        "分块方法": f"RecursiveCharacterTextSplitter (chunk_size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP})",
+        "检索方法": f"向量检索 + BM25混合检索 (α={HYBRID_ALPHA})",
+        "重排序模型": rerank_info,
         "生成模型(Ollama)": OLLAMA_MODEL_NAME,
         "生成模型(SiliconFlow)": SILICONFLOW_MODEL_NAME,
         "生成模型(Magick API)": MAGICK_MODEL_NAME,

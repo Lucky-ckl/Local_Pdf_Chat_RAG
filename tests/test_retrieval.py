@@ -59,11 +59,12 @@ def test_recursive_retrieval_returns_web_results_with_source_metadata(monkeypatc
     )
     monkeypatch.setattr(
         retriever.vector_store,
-        "search",
+        "search_with_scores",
         lambda query_embedding, k: (
             ["Local retrieval context."],
             ["doc-local"],
             [{"source": "local.pdf"}],
+            [0.1],
         ),
     )
     monkeypatch.setattr(retriever.bm25_manager, "bm25_index", None)
@@ -139,8 +140,8 @@ def test_recursive_retrieval_deduplicates_web_results_across_iterations(monkeypa
     )
     monkeypatch.setattr(
         retriever.vector_store,
-        "search",
-        lambda query_embedding, k: ([], [], []),
+        "search_with_scores",
+        lambda query_embedding, k: ([], [], [], []),
     )
     monkeypatch.setattr(retriever.bm25_manager, "bm25_index", None)
     monkeypatch.setattr(

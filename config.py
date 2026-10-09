@@ -49,6 +49,10 @@ OLLAMA_MODEL_NAME = os.getenv("OLLAMA_MODEL_NAME", "deepseek-r1:8b")
 SILICONFLOW_MODEL_NAME = os.getenv("SILICONFLOW_MODEL_NAME", "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B")
 MAGICK_MODEL_NAME = os.getenv("MAGICK_MODEL_NAME", "gpt-4o-mini")
 RERANK_METHOD = os.getenv("RERANK_METHOD", "cross_encoder")
+# 交叉编码器模型名（P1.2；仅 RERANK_METHOD=cross_encoder 时生效）。
+# 取舍：cross_encoder 精度更高但需下载模型（默认 BAAI/bge-reranker-base，中文友好）；
+#       llm 复用现行 LLM 服务、零额外下载，但更慢且分数稳定性依赖所选模型。
+RERANK_MODEL_NAME = os.getenv("RERANK_MODEL_NAME", "BAAI/bge-reranker-base")
 
 MODEL_CHOICES = ["ollama", "siliconflow", "magick"]
 MODEL_DISPLAY_NAMES = {
@@ -61,6 +65,38 @@ MODEL_DISPLAY_NAMES = {
 def is_configured_api_key(api_key):
     """判断 API Key 是否为用户实际配置值。"""
     return bool(api_key and api_key.strip() and not api_key.strip().startswith("Your"))
+
+
+def _env_int(name, default):
+    """读取整型环境变量；缺失或非法时回退默认值。"""
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        logging.warning(f"环境变量 {name}={raw!r} 不是合法整数，回退默认值 {default}")
+        return default
+
+
+def _env_float(name, default):
+    """读取浮点环境变量；缺失或非法时回退默认值。"""
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw.strip())
+    except ValueError:
+        logging.warning(f"环境变量 {name}={raw!r} 不是合法浮点数，回退默认值 {default}")
+        return default
+
+
+def _env_bool(name, default):
+    """读取布尔环境变量（1/true/yes/on 视为真）；缺失时回退默认值。"""
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
 def choose_default_model(siliconflow_key, magick_key, ollama_available=False):
@@ -77,12 +113,23 @@ def choose_default_model(siliconflow_key, magick_key, ollama_available=False):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 第四步：RAG 超参数
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CHUNK_SIZE = 400          # 文本分块大小（字符数）
-CHUNK_OVERLAP = 40        # 相邻分块的重叠字符数
-HYBRID_ALPHA = 0.7        # 混合检索中语义检索的权重（0-1）
-RETRIEVAL_TOP_K = 10      # 检索返回的候选文档数量
-RERANK_TOP_K = 5          # 重排序后保留的文档数量
-MAX_RETRIEVAL_ITERATIONS = 3  # 递归检索的最大迭代轮数
+CHUNK_SIZE = _env_int("CHUNK_SIZE", 400)          # 文本分块大小（字符数）
+CHUNK_OVERLAP = _env_int("CHUNK_OVERLAP", 40)     # 相邻分块的重叠字符数
+HYBRID_ALPHA = _env_float("HYBRID_ALPHA", 0.7)    # 混合检索中语义检索的权重（0-1）
+RETRIEVAL_TOP_K = _env_int("RETRIEVAL_TOP_K", 10)  # 检索返回的候选文档数量
+RERANK_TOP_K = _env_int("RERANK_TOP_K", 5)        # 重排序后保留的文档数量
+MAX_RETRIEVAL_ITERATIONS = _env_int("MAX_RETRIEVAL_ITERATIONS", 3)  # 递归检索的最大迭代轮数
+
+# 本次改造新增参数（P2 OCR / 索引持久化，P3 会话 / 流式）
+# 默认值依据 WBS v1.0 P0.3；OCR_MAX_PAGES 未由 WBS 指定，采用保守值 50（待确认）。
+OCR_ENABLED = _env_bool("OCR_ENABLED", True)        # 是否启用扫描件 OCR
+OCR_ENGINE = os.getenv("OCR_ENGINE", "rapidocr")    # OCR 引擎
+OCR_RENDER_DPI = _env_int("OCR_RENDER_DPI", 200)    # PDF 页渲染 DPI
+SCAN_TEXT_THRESHOLD = _env_int("SCAN_TEXT_THRESHOLD", 50)  # 每页平均有效字符数阈值
+OCR_MAX_PAGES = _env_int("OCR_MAX_PAGES", 50)       # 单文档 OCR 页数上限（WBS 未指定默认值）
+INDEX_DIR = os.getenv("INDEX_DIR", "data/index/")   # 索引持久化目录
+SESSION_MAX_TURNS = _env_int("SESSION_MAX_TURNS", 5)  # 多轮保留轮数
+SSE_HEARTBEAT_SEC = _env_int("SSE_HEARTBEAT_SEC", 15)  # 流式心跳间隔（秒）
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 第五步：运行时环境配置

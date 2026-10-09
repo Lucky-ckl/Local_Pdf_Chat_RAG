@@ -19,3 +19,37 @@ def test_unsupported_extension_returns_empty_string(tmp_path: Path):
     unsupported.write_bytes(b"not a supported document")
 
     assert extract_text(str(unsupported)) == ""
+
+
+def test_extract_docx_paragraphs(tmp_path: Path):
+    from docx import Document
+
+    docx_file = tmp_path / "sample.docx"
+    document = Document()
+    document.add_paragraph("RAG docx paragraph")
+    document.save(str(docx_file))
+
+    assert "RAG docx paragraph" in extract_text(str(docx_file))
+
+
+def test_extract_xlsx_sheets(tmp_path: Path):
+    import pandas as pd
+
+    xlsx_file = tmp_path / "sample.xlsx"
+    pd.DataFrame({"col": ["value1", "value2"]}).to_excel(xlsx_file, index=False, sheet_name="Sheet1")
+
+    text = extract_text(str(xlsx_file))
+    assert "Sheet1" in text
+    assert "value1" in text
+
+
+def test_extract_pptx_text(tmp_path: Path):
+    from pptx import Presentation
+
+    pptx_file = tmp_path / "sample.pptx"
+    presentation = Presentation()
+    slide = presentation.slides.add_slide(presentation.slide_layouts[5])
+    slide.shapes.title.text = "RAG pptx title"
+    presentation.save(str(pptx_file))
+
+    assert "RAG pptx title" in extract_text(str(pptx_file))

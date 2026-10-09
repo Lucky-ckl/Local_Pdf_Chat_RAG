@@ -1,0 +1,9 @@
+[run]
+source =
+    core
+    config
+
+[report]
+show_missing = true
+# P0.6 覆盖率基线：core/ + 新增模块合计 >= 60%（WBS v1.0 P0.6）
+fail_under = 60

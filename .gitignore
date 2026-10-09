@@ -28,3 +28,9 @@ htmlcov/
 # Local browser verification artifacts
 .playwright-cli/
 output/playwright/
+
+# Local API connectivity script (do not commit)
+/test.py
+
+# 索引持久化目录（P2，不进 Git）
+data/index/

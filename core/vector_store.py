@@ -121,29 +121,46 @@ class VectorStore:
         self.index = auto_index
         logging.info(f"FAISS 索引构建完成，共 {self.index.ntotal} 个文本块，类型: {auto_index.index_type}")
 
-    def search(self, query_embedding, k=10):
+    def search_with_scores(self, query_embedding, k=10):
         """
-        搜索最相似的向量
+        搜索最相似的向量，并返回真实距离。
+
+        索引为 L2 系列（IndexFlatL2 / IVFFlat / IVFPQ），返回的是**平方 L2 距离**，
+        数值越小代表越相似；此处原样返回，不在本层归一化。
 
         Returns:
-            (docs, doc_ids, metadatas)
+            (docs, doc_ids, metadatas, distances)
+            distances 为 float 列表，与 docs / doc_ids / metadatas 一一对应。
         """
         if self.index is None or self.index.ntotal == 0:
-            return [], [], []
+            return [], [], [], []
         try:
             D, I = self.index.search(query_embedding, k=k)
-            docs, doc_ids, metadatas = [], [], []
-            for faiss_idx in I[0]:
+            docs, doc_ids, metadatas, distances = [], [], [], []
+            for position, faiss_idx in enumerate(I[0]):
                 if faiss_idx != -1 and faiss_idx < len(self.id_order):
                     original_id = self.id_order[faiss_idx]
                     if original_id in self.contents_map:
                         docs.append(self.contents_map[original_id])
                         doc_ids.append(original_id)
                         metadatas.append(self.metadatas_map.get(original_id, {}))
-            return docs, doc_ids, metadatas
+                        distances.append(float(D[0][position]))
+            return docs, doc_ids, metadatas, distances
         except Exception as e:
             logging.error(f"FAISS 检索错误: {str(e)}")
-            return [], [], []
+            return [], [], [], []
+
+    def search(self, query_embedding, k=10):
+        """
+        搜索最相似的向量（保持既有三元组返回结构）。
+
+        如需真实距离（用于混合检索分数归一化），请使用 ``search_with_scores``。
+
+        Returns:
+            (docs, doc_ids, metadatas)
+        """
+        docs, doc_ids, metadatas, _ = self.search_with_scores(query_embedding, k=k)
+        return docs, doc_ids, metadatas
 
     @property
     def is_ready(self):
