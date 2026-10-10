@@ -34,3 +34,11 @@ output/playwright/
 
 # 索引持久化目录（P2，不进 Git）
 data/index/
+
+# 知识库文档目录（用户资料，不进 Git）
+data/documents/
+# 评测运行产物（可重新生成）
+eval/index/
+eval/results/
+eval/corpus/
+eval/samples/*.pdf

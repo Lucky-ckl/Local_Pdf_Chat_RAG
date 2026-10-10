@@ -11,7 +11,7 @@ English | [简体中文](README.zh-CN.md)
 
 </div>
 
-Local PDF Chat RAG is an educational and reference implementation for developers who want to inspect the complete retrieval-augmented generation pipeline. Document loading, chunking, embeddings, FAISS, BM25, hybrid retrieval, reranking, and answer generation are split into readable and replaceable modules. The repository includes both a Gradio UI and a FastAPI interface.
+Local PDF Chat RAG is an educational and reference implementation for developers who want to inspect the complete retrieval-augmented generation pipeline. Document loading, chunking, embeddings, FAISS, BM25, hybrid retrieval, reranking, and answer generation are split into readable and replaceable modules. The repository ships a hand-written native single page served directly by FastAPI (no frontend framework, no build step) plus a REST API.
 
 > This repository is intended for learning and experimentation. It is not a production-ready knowledge-base service. Add authentication, tenant isolation, persistence, evaluation, security controls, and deployment governance before using it with real business data.
 
@@ -23,15 +23,13 @@ Planned changes in this fork (**checked items are implemented; everything else i
 
 - [x] Repair the ineffective reranker (real CrossEncoder via config; visible failure and RRF fallback)
 - [x] Make hybrid-retrieval scores meaningful (fuse normalized real FAISS distances)
-- [ ] Add scanned-PDF OCR (text-layer vs. OCR dual path)
-- [ ] Persist the index so it survives restarts
-- [ ] Implement real multi-turn conversation and true streaming (SSE)
-- [ ] Rewrite the frontend (FastAPI + native single page, including a retrieval-process panel)
+- [x] Add scanned-PDF OCR (text-layer vs. OCR dual path)
+- [x] Persist the index so it survives restarts
+- [x] Implement real multi-turn conversation and true streaming (SSE)
+- [x] Rewrite the frontend (FastAPI + native single page, including a retrieval-process panel)
 - [ ] Build an evaluation harness (retrieval metrics and before/after comparison)
 
-> The authoritative plan of record is the project WBS. Only the checked items above are implemented; the rest are **not yet implemented**. See `docs/decisions.md` §7 for the P1 acceptance record.
-
-![Current Local PDF Chat RAG interface](images/demo-current.png)
+> The authoritative plan of record is the project WBS. Only the checked items above are implemented; the rest are **not yet implemented**. Per-phase acceptance records live in `docs/decisions.md` §7, `docs/p2-acceptance.md`, `docs/p3-acceptance.md`, and `docs/p4-acceptance.md`.
 
 ## Upstream project (reference)
 
@@ -44,7 +42,7 @@ The numbers, release history, and maintenance activity that were previously list
 - **Reranking**: uses a real CrossEncoder whose model name comes from `config.RERANK_MODEL_NAME` (default `BAAI/bge-reranker-base`). Reranking failures are no longer silent: when the reranker is unavailable (or disabled via `RERANK_METHOD=none`), the request degrades to RRF fusion and the outcome is exposed through `score_source`/status fields and logs. See `docs/baseline-defects.md` D1 (fixed) and `docs/decisions.md` §7. Known limitation: the default model has not yet been load-verified in this environment.
 - **Multiple model backends**: local Ollama, SiliconFlow, and OpenAI-compatible APIs.
 - **Document support**: PDF, TXT, Markdown, DOCX, XLS/XLSX, and PPTX.
-- **Two interfaces**: a Gradio web application and a FastAPI REST API.
+- **Single page + REST API**: FastAPI serves a hand-written native single page (no React/Vue, no build chain) and exposes a REST API.
 - **Verifiable maintenance**: automated tests, GitHub Actions CI, contribution guidance, and a security-reporting process.
 
 ## RAG pipeline
@@ -63,6 +61,24 @@ flowchart LR
     I --> J[LLM generation]
     J --> K[Answer and sources]
 ```
+
+## Interface preview
+
+Upload and document list (left), streaming answer with citations (middle), retrieval-process panel (right):
+
+![Overview: upload, document list, and index status](images/p4-01-overview.png)
+
+Citation markers in the answer are clickable and jump to the matching chunk in the retrieval-process panel:
+
+![Streaming answer and citation navigation](images/p4-02-chat-citations.png)
+
+The retrieval-process panel shows each candidate chunk's dense/bm25/fused scores, its rank before/after the rerank (or RRF-fallback) reordering, and the `score_source` fallback state (shown here with reference `[0]` located):
+
+![Retrieval-process panel with a highlighted citation](images/p4-03-retrieval-panel.png)
+
+Dark theme and the stacked layout at 768px:
+
+![Dark theme and narrow layout](images/p4-04-dark-narrow.png)
 
 ## Quick start
 
@@ -92,31 +108,27 @@ Edit `.env` and choose at least one option:
 
 Keep real credentials in your local `.env` file. Values beginning with `Your_` are treated as placeholders and are not valid credentials.
 
-### 3. Start the web UI
-
-```bash
-python rag_demo.py
-```
-
-The application first tries `http://127.0.0.1:17995`, then ports 17996–17999 if needed.
-
-### 4. Start the REST API
+### 3. Start the UI and API (single service)
 
 ```bash
 python api_router.py
 ```
 
+Open `http://127.0.0.1:17995/` for the UI. Static assets (`web/`) are served directly by FastAPI, with no frontend build step. The service first tries `http://127.0.0.1:17995`, then ports 17996–17999 if needed.
+
 Main endpoints:
 
-- `GET /api/status`: runtime and provider configuration status;
-- `POST /api/upload`: upload and process a document;
-- `POST /api/ask`: ask a question against processed documents.
+- `GET /api/status`: runtime state, three-state index status, and model configuration;
+- `GET /api/documents`: indexed documents (source, chunk count, OCR flag, page count);
+- `POST /api/upload`: upload and process documents (multiple files; `force_ocr` switch);
+- `POST /api/ask`: ask a question against processed documents (non-streaming, kept compatible);
+- `POST /api/ask/stream`: streaming (SSE) Q&A with the event order `retrieval → delta* → citation → done`.
 
 ## Repository layout
 
 ```text
 ├── config.py                  # Environment, model, and RAG settings
-├── rag_demo.py                # Gradio web UI
+├── web/                       # Native single page (index.html / app.css / app.js, no framework)
 ├── api_router.py              # FastAPI interface
 ├── core/
 │   ├── document_loader.py     # Document extraction

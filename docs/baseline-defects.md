@@ -50,7 +50,8 @@
   - `api_router.py:116`（REST 调用同样不传历史）
 - **复现命令**：`python -c "import inspect; from core.generator import query_answer; print(list(inspect.signature(query_answer).parameters))"`
 - **实际观察**：`['question', 'enable_web_search', 'model_choice', 'progress']` —— 无 `history`。
-- **状态**：已确认
+- **状态**：**已修复**（P3.1–P3.3，见 `docs/p3-acceptance.md`）。以上「复现命令/实际观察」描述的是**修复前**行为。
+- **修复**：`query_answer` / `stream_answer` / `recursive_retrieval` 均新增 `history` 参数（默认 `None`，无历史不改写）；`core/session.py` 提供有界会话状态（最近 `SESSION_MAX_TURNS` 轮）；有历史时经 `core/retriever.py::rewrite_query_with_history` 把省略追问改写为自包含问题；历史经 `core/generator.py::compress_history`（最近 1 轮完整 + 更早轮摘要，摘要带缓存）进入 prompt；`api_router.py` 的 `/api/ask` 与 `/api/ask/stream` 均按 `session_id` 传递历史并写回轮次。Gradio 入口此前同样未传历史：`rag_demo.py` 新增 `_gradio_history_to_turns`，`process_chat` 将 Gradio 累积历史转换为轮次并传入 `query_answer(..., history=...)`（覆盖 `rag_demo.py:337-363` 所述旧行为）。多轮改写/摘要的**真实 LLM 效果**仍待有可用后端时验证（机制已用测试替身覆盖），不属已确认结论。
 
 ### D3 — 流式为死代码
 
@@ -64,7 +65,8 @@
   `findstr /s /n /c:"stream_answer" *.py core\*.py features\*.py utils\*.py tests\*.py`
   `findstr /s /n /c:"\"stream\": False" core\*.py`
 - **实际观察**：`stream_answer` 仅 `core/generator.py:270` 一处（定义，无调用）；`"stream": False` 命中 `core/generator.py:71/154/254` 与 `core/reranker.py:79`。
-- **状态**：已确认
+- **状态**：**已修复**（P3.4–P3.6，见 `docs/p3-acceptance.md`）。以上「复现命令/实际观察」描述的是**修复前**行为。
+- **修复**：新增 `POST /api/ask/stream`（SSE）；`stream_answer()` 由死代码转为主路径（逐片 `yield` 正文增量），云端分支改用 `_stream_openai_compatible_api`（真实 `stream=True`），修复云端写死 `"stream": False`、整体生成后一次返回的问题；`api_router` 发心跳（`SSE_HEARTBEAT_SEC`）并处理断连/检索失败/生成中断。**说明**：`core/generator.py::_call_openai_compatible_api` 仍保留 `"stream": False`，属**非流式**入口（`/api/ask` 与查询改写用），为正确用法，非缺陷。
 
 ### D4 — 索引仅存内存
 
@@ -75,7 +77,8 @@
   - `core/vector_store.py:156-161` / `core/bm25_index.py:59-63`（`clear()` 仅清内存）
 - **复现命令**：`findstr /s /n /c:"write_index" /c:"read_index" /c:"INDEX_DIR" core\*.py`
 - **实际观察**：无匹配 —— 无任何持久化实现。`config.INDEX_DIR` 于 P0.3 新增，但当前尚无代码使用它。
-- **状态**：已确认
+- **状态**：**已修复**（P2.1，见 `docs/p2.1-acceptance.md`）。以上「复现命令/实际观察」描述的是**修复前**行为。
+- **修复**：`core/vector_store.py` 增加 `write_index`/`read_index` 落盘与 `manifest.json` 一致性校验；`core/bm25_index.py` 持久化 `ids+tokenized` 并重建 `BM25Okapi`（不 pickle）；提供 `save_persisted_index`/`load_persisted_index`，启动加载失败进入明确「未就绪」状态。
 
 ### D5 — 扫描件 PDF 未支持
 
@@ -85,7 +88,8 @@
   - `rag_demo.py:67-69`（`text = extract_text(...)`；`if not text: raise ValueError("文档内容为空或无法提取文本")`）
 - **复现命令**：`python -c "from core.document_loader import extract_text; print(len(extract_text('挖掘机维修案例(样例）.pdf')))"`
 - **实际观察**：示例 PDF（含文本层）返回 2025 字符。对**无文本层**的扫描件 PDF，本函数返回空串并触发上层 `ValueError`；本仓库未附扫描件样本，复现需自备扫描件 PDF。
-- **状态**：已确认（扫描件 → 空串 → 上层抛错为代码既定路径；样例 PDF 为文本型）
+- **状态**：**已修复**（P2.3–P2.5，见 `docs/p2-acceptance.md`）。以上描述的是**修复前**行为。
+- **修复**：新增 `core/ocr.py`（RapidOCR 离线引擎 + PyMuPDF 渲染 + 阅读顺序）；`core/document_loader.py` 按 §1.1.3「每页平均字符数」判定扫描件并逐页 OCR、对文本型文档的低文本页按页面级补足；扫描件 PDF 现可入库并被检索命中（E2E 证据见 P2 验收记录 §4）。
 
 ### D6 — 无评测 / trace / 索引持久化
 

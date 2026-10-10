@@ -50,9 +50,10 @@ SILICONFLOW_MODEL_NAME = os.getenv("SILICONFLOW_MODEL_NAME", "deepseek-ai/DeepSe
 MAGICK_MODEL_NAME = os.getenv("MAGICK_MODEL_NAME", "gpt-4o-mini")
 RERANK_METHOD = os.getenv("RERANK_METHOD", "cross_encoder")
 # 交叉编码器模型名（P1.2；仅 RERANK_METHOD=cross_encoder 时生效）。
-# 取舍：cross_encoder 精度更高但需下载模型（默认 BAAI/bge-reranker-base，中文友好）；
+# 默认 BAAI/bge-reranker-v2-m3：中文友好，且与 P5 评测实际使用的模型一致（本机离线可加载）。
+# 取舍：cross_encoder 精度更高但需下载模型；
 #       llm 复用现行 LLM 服务、零额外下载，但更慢且分数稳定性依赖所选模型。
-RERANK_MODEL_NAME = os.getenv("RERANK_MODEL_NAME", "BAAI/bge-reranker-base")
+RERANK_MODEL_NAME = os.getenv("RERANK_MODEL_NAME", "BAAI/bge-reranker-v2-m3")
 
 MODEL_CHOICES = ["ollama", "siliconflow", "magick"]
 MODEL_DISPLAY_NAMES = {
@@ -128,13 +129,15 @@ OCR_RENDER_DPI = _env_int("OCR_RENDER_DPI", 200)    # PDF 页渲染 DPI
 SCAN_TEXT_THRESHOLD = _env_int("SCAN_TEXT_THRESHOLD", 50)  # 每页平均有效字符数阈值
 OCR_MAX_PAGES = _env_int("OCR_MAX_PAGES", 50)       # 单文档 OCR 页数上限（WBS 未指定默认值）
 INDEX_DIR = os.getenv("INDEX_DIR", "data/index/")   # 索引持久化目录
+DOCUMENTS_DIR = os.getenv("DOCUMENTS_DIR", "data/documents/")  # 知识库文档目录（前端不提供上传，改为扫描此目录）
 SESSION_MAX_TURNS = _env_int("SESSION_MAX_TURNS", 5)  # 多轮保留轮数
 SSE_HEARTBEAT_SEC = _env_int("SSE_HEARTBEAT_SEC", 15)  # 流式心跳间隔（秒）
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 第五步：运行时环境配置
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+# 仅当用户/环境未指定 HF_ENDPOINT 时才默认使用镜像，保留环境变量覆盖能力。
+os.environ.setdefault('HF_ENDPOINT', 'https://hf-mirror.com')
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 os.environ['NO_PROXY'] = 'localhost,127.0.0.1'
 requests.adapters.DEFAULT_RETRIES = 3

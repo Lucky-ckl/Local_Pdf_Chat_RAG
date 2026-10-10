@@ -9,6 +9,8 @@
 
 import logging
 import math
+import time
+from dataclasses import dataclass
 from config import HYBRID_ALPHA, RETRIEVAL_TOP_K, RERANK_TOP_K, MAX_RETRIEVAL_ITERATIONS
 from core.vector_store import vector_store
 from core.bm25_index import bm25_manager
@@ -115,7 +117,10 @@ def hybrid_merge(semantic_results, bm25_results, alpha=None):
         for i, (doc_id, doc, meta) in enumerate(
                 zip(ids, semantic_results['documents'][0], semantic_results['metadatas'][0])):
             semantic_score = similarities[i] if similarities is not None else 0.0
-            merged_dict[doc_id] = {'score': alpha * semantic_score, 'content': doc, 'metadata': meta}
+            merged_dict[doc_id] = {
+                'score': alpha * semantic_score, 'content': doc, 'metadata': meta,
+                'dense_score': semantic_score, 'bm25_score': 0.0,
+            }
     else:
         logging.warning("语义检索结果为空或格式异常")
 
@@ -143,11 +148,13 @@ def hybrid_merge(semantic_results, bm25_results, alpha=None):
 
         if doc_id in merged_dict:
             merged_dict[doc_id]['score'] += (1 - alpha) * norm_score
+            merged_dict[doc_id]['bm25_score'] = norm_score
         else:
             metadata = vector_store.metadatas_map.get(doc_id, {})
             merged_dict[doc_id] = {
                 'score': (1 - alpha) * norm_score,
-                'content': result['content'], 'metadata': metadata
+                'content': result['content'], 'metadata': metadata,
+                'dense_score': 0.0, 'bm25_score': norm_score,
             }
 
     return sorted(merged_dict.items(), key=lambda x: x[1]['score'], reverse=True)
@@ -196,28 +203,135 @@ def _rrf_fallback_ranking(hybrid, dense_ids, bm25_results, top_k):
     ]
 
 
-def recursive_retrieval(initial_query, max_iterations=None, enable_web_search=False, model_choice="siliconflow"):
+@dataclass
+class RewriteResult:
+    """查询改写结果（WBS v1.0 P3.2）：供 P5 归因。"""
+
+    rewritten: str
+    rewrite_used: bool
+    rewrite_rule: str
+
+
+def _history_turns(history):
+    """把 history 规整为 ``[(question, answer), ...]``；兼容 Turn 对象与 dict。"""
+    turns = []
+    for item in history or []:
+        if isinstance(item, dict):
+            question = item.get("question", "")
+            answer = item.get("answer", "")
+        else:
+            question = getattr(item, "question", "")
+            answer = getattr(item, "answer", "")
+        if question or answer:
+            turns.append((question, answer))
+    return turns
+
+
+def _default_rewrite_fn(prompt, model_choice):
+    """默认改写实现（P3.2）：调用 LLM；返回错误占位串或空结果时视为**改写失败**并抛出，
+    由 ``rewrite_query_with_history`` 回退原 query，避免把「未配置 Key / 服务错误」的提示串当成检索查询。"""
+    from core.generator import call_llm_simple, is_llm_failure
+    result = call_llm_simple(prompt, model_choice)
+    if is_llm_failure(result):
+        raise RuntimeError("查询改写未获得有效 LLM 结果（可能未配置 Key 或服务不可用）")
+    return result
+
+
+def rewrite_query_with_history(question, history=None, model_choice="siliconflow", rewrite_fn=None):
+    """有历史时把「指代 / 省略」追问改写为自包含问题（WBS v1.0 P3.2）。
+
+    - **无历史轮次 → 不改写**（``rewrite_used=False``），避免无谓的 LLM 调用与语义漂移；
+    - 改写失败 / 超时 / 结果异常（空或过长）→ 回退原 query，不阻塞检索；
+    - 返回 ``RewriteResult(rewritten, rewrite_used, rewrite_rule)`` 供 P5 归因。
+    """
+    turns = _history_turns(history)
+    if not turns:
+        return RewriteResult(question, False, "")
+
+    conversation = "\n".join(f"用户：{q}\n助手：{a}" for q, a in turns[-3:])
+    prompt = (
+        "你是查询改写助手。请结合对话历史，把用户的最新问题改写为一个**自包含**的检索查询："
+        "补全其中的指代（如「它 / 那台」）与省略的主语，使其脱离上下文也能独立理解。\n"
+        "要求：\n"
+        "1. 只输出改写后的查询，不要解释、不要加引号；\n"
+        "2. 若最新问题本身已自包含，原样返回该问题；\n"
+        "3. 不要引入历史中未出现的新信息。\n\n"
+        f"[对话历史]\n{conversation}\n\n[最新问题]\n{question}\n\n[改写结果]"
+    )
+    try:
+        fn = rewrite_fn or _default_rewrite_fn
+        raw = fn(prompt, model_choice)
+        rewritten = (raw or "").strip().strip('"').strip()
+    except Exception as e:
+        logging.warning("查询改写失败，回退原 query：%s", e)
+        return RewriteResult(question, False, "")
+
+    if not rewritten or len(rewritten) > 200:
+        logging.warning("查询改写结果为空或过长（%d 字符），回退原 query", len(rewritten or ""))
+        return RewriteResult(question, False, "")
+    if rewritten == question:
+        return RewriteResult(question, False, "")
+    return RewriteResult(rewritten, True, "history_coreference")
+
+
+def recursive_retrieval(initial_query, max_iterations=None, enable_web_search=False,
+                        model_choice="siliconflow", history=None, rewrite_out=None, trace_out=None):
     """
     递归检索与查询优化
 
-    流程：1.语义+BM25检索 → 2.混合排序 → 3.重排序 → 4.LLM判断是否改写query继续
+    流程：0.有历史时先做查询改写（P3.2）→ 1.语义+BM25检索 → 2.混合排序 → 3.重排序 →
+          4.LLM判断是否改写query继续
+
+    Args:
+        history: 会话历史（list[Turn] 或 list[dict]）；仅非空时触发查询改写（P3.2）。
+        rewrite_out: 可选 dict；写入 ``rewritten`` / ``rewrite_used`` / ``rewrite_rule``。
+        trace_out: 可选 dict；写入本次召回候选的分数明细与 ``score_source``（供 SSE retrieval 事件）。
 
     Returns:
-        (all_contexts, all_doc_ids, all_metadata)
+        (all_contexts, all_doc_ids, all_metadata)   # 保持既有三元组返回，兼容原有调用方
     """
     if max_iterations is None:
         max_iterations = MAX_RETRIEVAL_ITERATIONS
 
-    query = initial_query
+    _rewrite_started = time.perf_counter()
+    rewrite = rewrite_query_with_history(initial_query, history, model_choice)
+    rewrite_ms = (time.perf_counter() - _rewrite_started) * 1000.0
+    rewrite_fields = {
+        "rewritten": rewrite.rewritten,
+        "rewrite_used": rewrite.rewrite_used,
+        "rewrite_rule": rewrite.rewrite_rule,
+    }
+    if rewrite_out is not None:
+        rewrite_out.update(rewrite_fields)
+    if trace_out is not None:
+        trace_out.update(rewrite_fields)
+
+    query = rewrite.rewritten
     all_contexts, all_doc_ids, all_metadata = [], [], []
     seen_web_sources = set()
+    # 本次请求最后一轮的重排状态（请求级，避免读取模块级全局导致并发串扰）；None 表示本轮未执行重排。
+    last_status = None
+    # 轻量检索 trace（P3.5 / §11.3）：只记录**实际执行**的阶段与耗时，未执行的步骤不写入。
+    trace = {
+        "iterations": 0,
+        "max_iterations": max_iterations,
+        "rewrite_used": bool(rewrite.rewrite_used),
+        "enable_web_search": bool(enable_web_search),
+        "web_search_used": False,
+        "stages_ms": {"rewrite": round(rewrite_ms, 3)},
+    }
+
+    def _add_stage_ms(name, elapsed_ms):
+        trace["stages_ms"][name] = round(trace["stages_ms"].get(name, 0.0) + elapsed_ms, 3)
 
     for i in range(max_iterations):
+        trace["iterations"] += 1
         logging.info(f"递归检索 {i + 1}/{max_iterations}，当前 Query: {query}")
 
         # 网络搜索补充
         web_texts = []
         if enable_web_search and check_serpapi_key():
+            trace["web_search_used"] = True
             try:
                 for res in search_web(query):
                     title = res.get('title') or ''
@@ -239,10 +353,12 @@ def recursive_retrieval(initial_query, max_iterations=None, enable_web_search=Fa
                 logging.error(f"网络搜索出错: {str(e)}")
 
         # 语义检索（连同真实平方 L2 距离，用于混合分数归一化）
+        _stage = time.perf_counter()
         query_embedding = encode_query(query)
         sem_docs, sem_ids, sem_metas, sem_distances = vector_store.search_with_scores(
             query_embedding, k=RETRIEVAL_TOP_K
         )
+        _add_stage_ms("semantic", (time.perf_counter() - _stage) * 1000.0)
 
         prepared = {
             "ids": [sem_ids],
@@ -252,10 +368,14 @@ def recursive_retrieval(initial_query, max_iterations=None, enable_web_search=Fa
         }
 
         # BM25 检索
+        _stage = time.perf_counter()
         bm25_res = bm25_manager.search(query, top_k=RETRIEVAL_TOP_K) if bm25_manager.bm25_index else []
+        _add_stage_ms("bm25", (time.perf_counter() - _stage) * 1000.0)
 
         # 混合排序 → 重排序
+        _stage = time.perf_counter()
         hybrid = hybrid_merge(prepared, bm25_res)
+        _add_stage_ms("hybrid_merge", (time.perf_counter() - _stage) * 1000.0)
         ids_iter, docs_iter, meta_iter = [], [], []
         for doc_id, data in hybrid[:RETRIEVAL_TOP_K]:
             ids_iter.append(doc_id)
@@ -263,6 +383,7 @@ def recursive_retrieval(initial_query, max_iterations=None, enable_web_search=Fa
             meta_iter.append(data['metadata'])
 
         if docs_iter:
+            _stage = time.perf_counter()
             reranked = None
             try:
                 reranked = rerank_results(query, docs_iter, ids_iter, meta_iter, top_k=RERANK_TOP_K)
@@ -277,9 +398,11 @@ def recursive_retrieval(initial_query, max_iterations=None, enable_web_search=Fa
                     "重排服务调用失败：本轮结果未经过重排序精排（score_source=rrf，已回退到 RRF 融合排序）"
                 )
                 reranked = _rrf_fallback_ranking(hybrid, sem_ids, bm25_res, RERANK_TOP_K)
+                last_status = reranker.RerankStatus(reranker.SCORE_SOURCE_RRF, False, True)
             elif status is not None and status.score_source == reranker.SCORE_SOURCE_RRF:
                 # 重排未生效（用户关闭或服务故障）：用真实 RRF 融合结果取代未经重排的候选顺序。
                 reranked = _rrf_fallback_ranking(hybrid, sem_ids, bm25_res, RERANK_TOP_K)
+                last_status = status
                 if status.rerank_unavailable:
                     logging.warning(
                         "重排服务不可用：本轮结果未经过重排序精排（score_source=rrf，已回退到 RRF 融合排序）"
@@ -288,6 +411,10 @@ def recursive_retrieval(initial_query, max_iterations=None, enable_web_search=Fa
                     logging.info(
                         "重排已由用户关闭（RERANK_METHOD=none）：本轮使用 RRF 融合排序（score_source=rrf）"
                     )
+            else:
+                # 重排成功；status 为 None（旧式纯列表返回）时按重排成功处理。
+                last_status = status or reranker.RerankStatus(reranker.SCORE_SOURCE_RERANK, False, False)
+            _add_stage_ms("rerank", (time.perf_counter() - _stage) * 1000.0)
         else:
             reranked = []
 
@@ -299,6 +426,39 @@ def recursive_retrieval(initial_query, max_iterations=None, enable_web_search=Fa
                 all_contexts.append(data['content'])
                 all_metadata.append(data['metadata'])
             current_contexts.append(data['content'])
+
+        if trace_out is not None:
+            # 记录本轮回召候选的分数明细（供 P3.5 / P4.5 retrieval 事件；index 与数组下标一致）。
+            score_source = last_status.score_source if last_status else reranker.SCORE_SOURCE_RRF
+            payload_by_id = {doc_id: data for doc_id, data in hybrid}
+            rank_before = {doc_id: pos for pos, (doc_id, _data) in enumerate(hybrid, start=1)}
+            rank_after = {doc_id: pos for pos, (doc_id, _data) in enumerate(reranked, start=1)}
+            chunks = []
+            for pos, (doc_id, data) in enumerate(reranked[:RETRIEVAL_TOP_K]):
+                metadata = data.get('metadata') or {}
+                fused_payload = payload_by_id.get(doc_id) or {}
+                chunks.append({
+                    "index": pos,
+                    "chunk_id": doc_id,
+                    "source": metadata.get("source", ""),
+                    "page": metadata.get("page", 0),
+                    "chunk_index": metadata.get("chunk_index", 0),
+                    "preview": (data.get('content') or "")[:200],
+                    "dense_score": fused_payload.get('dense_score'),
+                    "bm25_score": fused_payload.get('bm25_score'),
+                    "fused_score": fused_payload.get('score'),
+                    "rerank_score": data.get('score') if score_source == reranker.SCORE_SOURCE_RERANK else None,
+                    "rank_before": rank_before.get(doc_id),
+                    "rank_after": rank_after.get(doc_id),
+                    "ocr_used": bool(metadata.get("ocr_used", False)),
+                })
+            trace_out["chunks"] = chunks
+            trace_out["score_source"] = score_source
+            trace_out["rerank_disabled_by_user"] = (
+                bool(last_status.rerank_disabled_by_user) if last_status else False
+            )
+            trace_out["rerank_unavailable"] = bool(last_status.rerank_unavailable) if last_status else False
+            trace_out["retrieval_trace"] = dict(trace)
 
         if i == max_iterations - 1:
             break

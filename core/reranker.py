@@ -60,18 +60,50 @@ _cross_encoder = None
 _cross_encoder_lock = threading.Lock()
 
 
+def _has_local_snapshot(model_name):
+    """判断模型是否已存在于本地 HuggingFace 缓存中（只查本地，不联网）。"""
+    try:
+        from huggingface_hub import snapshot_download
+        snapshot_download(model_name, local_files_only=True)
+        return True
+    except Exception:
+        return False
+
+
+def _load_cross_encoder(model_name):
+    """加载交叉编码器：本地缓存优先，缓存缺失时回退到可联网的常规加载。
+
+    若模型已在本地缓存中，则临时将 huggingface_hub 置为离线模式后再加载，避免因
+    HF_ENDPOINT（如镜像）不可达而把「已缓存的模型」误判为加载失败；缓存缺失时保持
+    原有行为，仍可正常联网下载。加载结束后立即恢复原有离线状态。
+    """
+    from sentence_transformers import CrossEncoder
+
+    if not _has_local_snapshot(model_name):
+        return CrossEncoder(model_name)
+
+    import huggingface_hub.constants as hf_constants
+
+    previous_offline = hf_constants.HF_HUB_OFFLINE
+    hf_constants.HF_HUB_OFFLINE = True
+    try:
+        return CrossEncoder(model_name)
+    finally:
+        hf_constants.HF_HUB_OFFLINE = previous_offline
+
+
 def get_cross_encoder():
     """懒加载交叉编码器模型（双重检查锁定，线程安全）
 
     模型名来自 config.RERANK_MODEL_NAME（P1.2），不再硬编码。
+    本地缓存优先；加载失败仍按原逻辑记录日志并降级（P1.1）。
     """
     global _cross_encoder, rerank_unavailable
     if _cross_encoder is None:
         with _cross_encoder_lock:
             if _cross_encoder is None:
                 try:
-                    from sentence_transformers import CrossEncoder
-                    _cross_encoder = CrossEncoder(RERANK_MODEL_NAME)
+                    _cross_encoder = _load_cross_encoder(RERANK_MODEL_NAME)
                     logging.info("交叉编码器加载成功: %s", RERANK_MODEL_NAME)
                 except Exception as e:
                     _cross_encoder = None

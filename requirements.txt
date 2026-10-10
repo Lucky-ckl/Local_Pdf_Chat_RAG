@@ -1,5 +1,5 @@
 # 核心依赖
-gradio>=6.0.0,<7.0.0
+# P4.1：已删除 Gradio 入口（rag_demo.py），前端改为原生单页 + FastAPI 静态托管，故不再依赖 gradio
 pdfminer.six>=20221105
 sentence-transformers>=2.2.2
 faiss-cpu
@@ -27,3 +27,9 @@ rank-bm25>=0.2.2
 
 # 系统监控
 psutil>=5.9.0
+
+# OCR 与 PDF 渲染（P2.3 OCR 引擎 / P2.4 PDF 页渲染）
+# rapidocr_onnxruntime：纯 pip、模型随 wheel 内置、完全离线可跑（WBS v1.0 P2.3）
+rapidocr_onnxruntime>=1.4.0
+# PyMuPDF（fitz）：纯 pip wheel，无需 poppler 等系统级软件（WBS v1.0 P2.4）
+PyMuPDF>=1.24.0

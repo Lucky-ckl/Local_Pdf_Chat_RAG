@@ -11,7 +11,7 @@
 
 </div>
 
-Local PDF Chat RAG 面向希望理解检索增强生成完整链路的开发者。项目把文档解析、文本分块、向量化、FAISS、BM25、混合检索、重排序和回答生成拆成可以单独阅读、测试和替换的模块，并提供 Gradio 界面和 FastAPI 接口。
+Local PDF Chat RAG 面向希望理解检索增强生成完整链路的开发者。项目把文档解析、文本分块、向量化、FAISS、BM25、混合检索、重排序和回答生成拆成可以单独阅读、测试和替换的模块，并提供由 FastAPI 直接托管的原生单页界面（无前端框架、无构建链）与 REST 接口。
 
 > 本仓库是教学与实验用途的参考实现，不是开箱即用的生产级知识库服务。用于真实业务前，请补充身份鉴权、租户隔离、持久化、评测、安全审计和部署治理。
 
@@ -23,15 +23,13 @@ Local PDF Chat RAG 面向希望理解检索增强生成完整链路的开发者�
 
 - [x] 修复失效的重排序（改用真正的 CrossEncoder，并让降级可见）
 - [x] 让混合检索分数可信（对真实距离/相似度做归一化）
-- [ ] 增加扫描件 OCR（文本层 / OCR 双路径）
-- [ ] 索引持久化，重启不丢失
-- [ ] 真正的多轮对话与真实流式输出（SSE）
-- [ ] 重写前端（FastAPI + 原生单页，含检索过程面板）
+- [x] 增加扫描件 OCR（文本层 / OCR 双路径）
+- [x] 索引持久化，重启不丢失
+- [x] 真正的多轮对话与真实流式输出（SSE）
+- [x] 重写前端（FastAPI + 原生单页，含检索过程面板）
 - [ ] 建立评测体系（检索指标与改造前后对比）
 
-> 总体依据为项目 WBS；仅上述已勾选项已实现，其余当前**尚未实现**。P1 验收记录见 `docs/decisions.md` §7。
-
-![Local PDF Chat RAG 当前界面](images/demo-current.png)
+> 总体依据为项目 WBS；仅上述已勾选项已实现，其余当前**尚未实现**。分阶段验收记录见 `docs/decisions.md` §7、`docs/p2-acceptance.md`、`docs/p3-acceptance.md` 与 `docs/p4-acceptance.md`。
 
 ## 上游项目（来源参考）
 
@@ -44,7 +42,7 @@ Local PDF Chat RAG 面向希望理解检索增强生成完整链路的开发者�
 - **重排序**：使用真正的交叉编码器（CrossEncoder），模型名取自 `config.RERANK_MODEL_NAME`（默认 `BAAI/bge-reranker-base`）。重排失败不再静默：重排不可用（或经 `RERANK_METHOD=none` 关闭）时降级为 RRF 融合，并通过 `score_source`/状态字段与日志体现。见 `docs/baseline-defects.md` D1（已修复）与 `docs/decisions.md` §7。已知限制：默认模型尚未在本环境完成真实加载验证。
 - **多模型后端**：支持本地 Ollama、SiliconFlow 以及 OpenAI-compatible API。
 - **多种文档格式**：支持 PDF、TXT、Markdown、DOCX、XLS/XLSX 和 PPTX。
-- **双入口**：提供 Gradio Web UI 和 FastAPI REST API。
+- **单页前端 + REST API**：由 FastAPI 直接托管手写的原生单页（无 React/Vue、无构建链），同时提供 REST API。
 - **可验证维护**：包含自动化测试、GitHub Actions CI、贡献指南和安全报告流程。
 
 ## RAG 流程
@@ -63,6 +61,24 @@ flowchart LR
     I --> J[LLM 生成]
     J --> K[回答与来源]
 ```
+
+## 界面预览
+
+上传与文档列表（左）、流式问答与引用（中）、检索过程面板（右）：
+
+![界面总览：上传、文档列表与索引状态](images/p4-01-overview.png)
+
+回答中的引用编号可点击，定位并高亮检索过程面板中对应的 chunk：
+
+![流式问答与引用定位](images/p4-02-chat-citations.png)
+
+检索过程面板展示每个候选 chunk 的 dense/bm25/fused 分数、重排（或 RRF 降级重排）前后的排名与 `score_source` 降级状态（截图为检索过程面板中引用 `[0]` 被定位后的状态）：
+
+![检索过程面板与引用高亮](images/p4-03-retrieval-panel.png)
+
+深色主题与窄屏（768px）下的纵向堆叠布局：
+
+![深色主题与窄屏布局](images/p4-04-dark-narrow.png)
 
 ## 快速开始
 
@@ -92,31 +108,27 @@ cp example.env .env
 
 密钥只保存在本地 `.env` 中。请勿提交真实密钥；示例配置中的 `Your_...` 占位符不会被识别为有效密钥。
 
-### 3. 启动 Web UI
-
-```bash
-python rag_demo.py
-```
-
-应用默认尝试 `http://127.0.0.1:17995`，端口被占用时会依次尝试 17996–17999。
-
-### 4. 启动 REST API
+### 3. 启动界面与 API（同一服务）
 
 ```bash
 python api_router.py
 ```
 
+打开 `http://127.0.0.1:17995/` 即为界面。静态资源（`web/`）由 FastAPI 直接托管，无需任何前端构建步骤。服务默认尝试 `http://127.0.0.1:17995`，端口被占用时会依次尝试 17996–17999。
+
 主要接口：
 
-- `GET /api/status`：运行状态与后端配置状态；
-- `POST /api/upload`：上传并处理文档；
-- `POST /api/ask`：基于已处理文档提问。
+- `GET /api/status`：运行状态、索引三态与模型配置状态；
+- `GET /api/documents`：已入库文档列表（来源、chunk 数、OCR 标记、页数）；
+- `POST /api/upload`：上传并处理文档（多文件；支持 `force_ocr` 开关）；
+- `POST /api/ask`：基于已处理文档提问（兼容非流式接口）；
+- `POST /api/ask/stream`：流式（SSE）问答，事件顺序 `retrieval → delta* → citation → done`。
 
 ## 项目结构
 
 ```text
 ├── config.py                  # 环境变量、模型与 RAG 参数
-├── rag_demo.py                # Gradio Web UI
+├── web/                       # 原生单页前端（index.html / app.css / app.js，无框架）
 ├── api_router.py              # FastAPI 接口
 ├── core/
 │   ├── document_loader.py     # 文档解析

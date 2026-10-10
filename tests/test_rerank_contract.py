@@ -224,3 +224,85 @@ def test_rrf_fallback_is_real_fusion_not_candidate_order(monkeypatch):
 
     assert doc_ids == ["A", "C", "B"]
     assert contexts == ["ctx-A", "ctx-C", "ctx-B"]
+
+
+# ── 5. retrieval trace 契约（P3.5 / §11.3） ──────────────────────
+def _trace_for_status(monkeypatch, status, metadata=None, distances=None):
+    metadata = [{"source": "A"}] if metadata is None else metadata
+    distances = [0.05] if distances is None else distances
+    monkeypatch.setattr(retriever, "encode_query", lambda q: np.zeros((1, 384), dtype="float32"))
+    monkeypatch.setattr(
+        retriever.vector_store,
+        "search_with_scores",
+        lambda query_embedding, k: (["ctx-A"], ["A"], metadata, distances),
+    )
+    monkeypatch.setattr(retriever.bm25_manager, "bm25_index", None)
+    monkeypatch.setattr(
+        retriever,
+        "rerank_results",
+        lambda query, docs, ids, metadata, top_k: reranker.RerankResult(
+            [(doc_id, {"content": d, "metadata": m, "score": 1.0})
+             for doc_id, d, m in zip(ids, docs, metadata)],
+            status,
+        ),
+    )
+    trace = {}
+    retriever.recursive_retrieval("q", max_iterations=1, trace_out=trace)
+    return trace
+
+
+def test_trace_reports_rerank_success(monkeypatch):
+    trace = _trace_for_status(monkeypatch, reranker.RerankStatus("rerank", False, False))
+    assert trace["score_source"] == "rerank"
+    assert trace["rerank_disabled_by_user"] is False
+    assert trace["rerank_unavailable"] is False
+    assert trace["chunks"][0]["rerank_score"] == 1.0
+
+
+def test_trace_distinguishes_user_disabled_from_service_failure(monkeypatch):
+    disabled = _trace_for_status(monkeypatch, reranker.RerankStatus("rrf", True, False))
+    assert (
+        disabled["score_source"], disabled["rerank_disabled_by_user"], disabled["rerank_unavailable"]
+    ) == ("rrf", True, False)
+    # RRF 降级时不得把融合分数冒充为 rerank 分数。
+    assert disabled["chunks"][0]["rerank_score"] is None
+
+    failure = _trace_for_status(monkeypatch, reranker.RerankStatus("rrf", False, True))
+    assert (
+        failure["score_source"], failure["rerank_disabled_by_user"], failure["rerank_unavailable"]
+    ) == ("rrf", False, True)
+
+
+def test_trace_chunk_exposes_metadata_and_fused_score(monkeypatch):
+    trace = _trace_for_status(
+        monkeypatch,
+        reranker.RerankStatus("rerank", False, False),
+        metadata=[{"source": "a.pdf", "page": 2, "chunk_index": 4, "ocr_used": True}],
+        distances=[0.5],
+    )
+    chunk = trace["chunks"][0]
+    assert chunk["index"] == 0
+    assert chunk["source"] == "a.pdf"
+    assert chunk["page"] == 2
+    assert chunk["chunk_index"] == 4
+    assert chunk["ocr_used"] is True
+    assert chunk["dense_score"] == pytest.approx(1.0 / 1.5)
+    assert chunk["fused_score"] is not None
+
+
+def test_trace_chunk_metadata_defaults_when_missing(monkeypatch):
+    trace = _trace_for_status(monkeypatch, reranker.RerankStatus("rerank", False, False))
+    chunk = trace["chunks"][0]
+    assert chunk["page"] == 0
+    assert chunk["chunk_index"] == 0
+    assert chunk["ocr_used"] is False
+
+
+def test_trace_reports_only_executed_stages(monkeypatch):
+    trace = _trace_for_status(monkeypatch, reranker.RerankStatus("rerank", False, False))
+    rt = trace["retrieval_trace"]
+    assert rt["iterations"] == 1
+    assert rt["web_search_used"] is False      # 未联网
+    assert "semantic" in rt["stages_ms"]
+    assert "rerank" in rt["stages_ms"]
+    assert "web_search" not in rt["stages_ms"]  # 未执行步骤不得报为已执行

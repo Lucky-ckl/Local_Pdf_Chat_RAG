@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>本地 RAG · 知识库问答</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body data-theme="light">
+  <div class="deco" aria-hidden="true">
+    <span class="sparkle s1">✦</span>
+    <span class="sparkle s2">✧</span>
+    <span class="sparkle s3">✿</span>
+    <span class="sparkle s4">✦</span>
+  </div>
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="avatar" aria-hidden="true">🐾</span>
+      <div class="brand-text">
+        <h1>本地 RAG 知识库</h1>
+        <p id="kb-hint" class="brand-sub">正在准备资料…</p>
+      </div>
+    </div>
+    <div class="topbar-actions">
+      <button id="sync-btn" class="btn btn-ghost btn-sm" type="button"
+              title="把知识库目录里新增的文档加入索引">🔄 同步资料</button>
+      <button id="theme-toggle" class="btn btn-ghost btn-sm" type="button" title="切换深浅配色">🌙</button>
+    </div>
+  </header>
+
+  <main class="chat-shell">
+    <div id="chat-log" class="chat-log" aria-live="polite"></div>
+
+    <form id="ask-form" class="composer" autocomplete="off">
+      <textarea id="question" rows="1" placeholder="把你的问题告诉我吧～（Enter 发送，Shift + Enter 换行）"></textarea>
+      <div class="composer-row">
+        <label class="chip-toggle"><input id="web-search" type="checkbox"> 联网补充</label>
+        <button id="clear-btn" class="btn btn-ghost btn-sm" type="button">新的对话</button>
+        <button id="ask-btn" class="btn btn-primary" type="submit">发送 💬</button>
+      </div>
+    </form>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

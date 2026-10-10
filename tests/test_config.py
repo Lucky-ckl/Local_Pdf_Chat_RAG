@@ -100,7 +100,7 @@ def test_rerank_model_name_defaults_and_is_env_overridable():
         cwd=str(repo_root),
     )
     assert default.returncode == 0, default.stderr
-    assert default.stdout.strip() == "BAAI/bge-reranker-base"
+    assert default.stdout.strip() == "BAAI/bge-reranker-v2-m3"
 
     env["RERANK_MODEL_NAME"] = "BAAI/bge-reranker-large"
     overridden = subprocess.run(
@@ -117,4 +117,4 @@ def test_rerank_model_name_defaults_and_is_env_overridable():
 def test_example_env_documents_rerank_model_name():
     repo_root = Path(__file__).resolve().parents[1]
     text = (repo_root / "example.env").read_text(encoding="utf-8")
-    assert "RERANK_MODEL_NAME=BAAI/bge-reranker-base" in text
+    assert "RERANK_MODEL_NAME=BAAI/bge-reranker-v2-m3" in text

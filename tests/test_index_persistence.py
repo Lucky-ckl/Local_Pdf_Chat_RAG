@@ -186,3 +186,22 @@ def test_config_mismatch_refuses_load(tmp_path, monkeypatch):
     assert state["status"] == "mismatch"
     assert vector_store_module.vector_store.is_ready is False
     assert "重建" in state["message"]
+
+
+def test_chunk_page_metadata_roundtrips_through_persistence(tmp_path):
+    metas = [
+        {"source": "a.pdf", "doc_id": "d1", "page": 1, "chunk_index": 0, "ocr_used": False},
+        {"source": "a.pdf", "doc_id": "d1", "page": 2, "chunk_index": 1, "ocr_used": True},
+        {"source": "a.pdf", "doc_id": "d1", "page": 2, "chunk_index": 2, "ocr_used": True},
+    ]
+    store = VectorStore()
+    store.build_index(CHUNKS, IDS, metas, _embeddings(len(CHUNKS)))
+    assert store.save(str(tmp_path)) is True
+
+    reloaded = VectorStore()
+    assert reloaded.load(str(tmp_path)) is True
+
+    meta = reloaded.metadatas_map["c2"]
+    assert meta["page"] == 2
+    assert meta["chunk_index"] == 1
+    assert meta["ocr_used"] is True

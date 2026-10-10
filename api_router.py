@@ -1,12 +1,14 @@
 """
 REST API 模块（使用FastAPI实现）
 """
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-import tempfile
 import os
 import re
+import json
 from typing import Dict, Any, List, Optional
 import logging
 import asyncio
@@ -14,25 +16,22 @@ from contextlib import asynccontextmanager
 from version import __version__
 
 # 从重构后的模块导入
-from config import SILICONFLOW_API_KEY, MAGICK_API_KEY, is_configured_api_key
-from core.generator import query_answer
+from config import (
+    SILICONFLOW_API_KEY, MAGICK_API_KEY, is_configured_api_key, SSE_HEARTBEAT_SEC,
+    INDEX_DIR, DEFAULT_MODEL_CHOICE, MODEL_CHOICES, MODEL_DISPLAY_NAMES,
+)
+from core.generator import query_answer, stream_answer_events
+from core.ingest import list_documents, sync_documents
+from core.session import session_store
+from core.system_info import get_system_models_info
 from core.vector_store import vector_store, load_persisted_index
+from core.embeddings import EMBED_MODEL_NAME
 from features.web_search import check_serpapi_key
 from utils.network import is_port_available
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("rag-api")
-
-
-class ProgressCallback:
-    def __init__(self):
-        self.progress = 0
-        self.description = ""
-
-    def __call__(self, progress, desc=None):
-        self.progress = progress
-        self.description = desc or ""
-        return self
+logger.setLevel(logging.INFO)  # 显式设置，避免根 logger 级别（可能为 WARNING）过滤掉 INFO 级断连/终止日志
 
 
 INDEX_STATE = {"status": "unknown", "message": "", "chunks": 0}
@@ -45,6 +44,12 @@ async def lifespan(app: FastAPI):
     global INDEX_STATE
     INDEX_STATE = load_persisted_index()
     logger.info("索引状态: %s - %s", INDEX_STATE.get("status"), INDEX_STATE.get("message"))
+    # 知识库目录同步：扫描 data/documents，把新增文档增量入库（不清空已有文档）。
+    try:
+        summary = await asyncio.to_thread(sync_documents)
+        logger.info("知识库同步: %s", summary.get("message"))
+    except Exception as e:
+        logger.error("启动时同步知识库失败: %s", e)
     yield
     logger.info("API 服务已关闭")
 
@@ -62,11 +67,22 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 
+# P4.1：托管原生单页（无前端框架 / 无构建链）。静态资源由 FastAPI 直接挂载。
+WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
+app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
+
+
+@app.get("/", include_in_schema=False)
+async def web_index():
+    """返回前端单页（P4.1）。"""
+    return FileResponse(os.path.join(WEB_DIR, "index.html"))
+
 
 class QuestionRequest(BaseModel):
     question: str
     enable_web_search: bool = False
-    model_choice: str = "siliconflow"
+    model_choice: Optional[str] = None
+    session_id: Optional[str] = None
 
 
 class AnswerResponse(BaseModel):
@@ -75,52 +91,33 @@ class AnswerResponse(BaseModel):
     metadata: Dict[str, Any]
 
 
-class FileProcessResult(BaseModel):
-    status: str
-    message: str
-    file_info: Optional[Dict[str, Any]] = None
+@app.post("/api/upload")
+async def upload_files():
+    """已废弃（P6.1）：本版本统一采用知识库目录同步模式，不再接受上传。
 
-
-@app.post("/api/upload", response_model=FileProcessResult)
-async def upload_file(file: UploadFile = File(...)):
-    """处理文档并存入向量数据库"""
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as tmp:
-            content = await file.read()
-            tmp.write(content)
-            tmp_path = tmp.name
-
-        from rag_demo import process_multiple_files
-        progress = ProgressCallback()
-
-        result_text = await asyncio.to_thread(
-            process_multiple_files,
-            [type('obj', (object,), {"name": tmp_path})],
-            progress
-        )
-
-        os.unlink(tmp_path)
-        result = result_text[0] if isinstance(result_text, tuple) else result_text
-        chunk_match = re.search(r'(\d+) 个文本块', result)
-        chunks = int(chunk_match.group(1)) if chunk_match else 0
-
-        return {
-            "status": "success" if "成功" in result else "error",
-            "message": result,
-            "file_info": {"filename": file.filename, "chunks": chunks}
-        }
-    except Exception as e:
-        logger.error(f"文件处理失败: {str(e)}")
-        raise HTTPException(500, f"文档处理失败: {str(e)}") from e
+    保留该路由仅为了让旧的调用方收到**明确错误**（而不是静默失败）。它**绝不**再调用
+    ``ingest_files(reset=True)``，因此不会清空或覆盖已有索引。如需新增文档，请把文件放入
+    知识库目录（``config.DOCUMENTS_DIR``，默认 ``data/documents``）后调用 ``POST /api/kb/refresh``。
+    """
+    raise HTTPException(
+        status_code=410,
+        detail="当前版本采用知识库目录同步模式，请将文件放入 data/documents 后点击同步",
+    )
 
 
 @app.post("/api/ask", response_model=AnswerResponse)
 async def ask_question(req: QuestionRequest):
-    """问答接口"""
+    """问答接口（非流式，兼容入口；P3.2：支持 session_id 多轮历史）"""
     if not req.question:
         raise HTTPException(400, "问题不能为空")
     try:
-        answer = await asyncio.to_thread(query_answer, req.question, req.enable_web_search, req.model_choice)
+        session = session_store.get_or_create(req.session_id)
+        history = session.history()
+        model_choice = req.model_choice or DEFAULT_MODEL_CHOICE
+        answer = await asyncio.to_thread(
+            query_answer, req.question, req.enable_web_search, model_choice, None, history
+        )
+        session_store.append_turn(session.session_id, req.question, answer, [])
         sources = []
         url_matches = re.findall(r'\[(网络来源|本地文档):[^\]]+\]\s*(?:\(URL:\s*([^)]+)\))?', answer)
         for source_type, url in url_matches:
@@ -128,15 +125,153 @@ async def ask_question(req: QuestionRequest):
 
         return {
             "answer": answer, "sources": sources,
-            "metadata": {"enable_web_search": req.enable_web_search, "model": req.model_choice}
+            "metadata": {"enable_web_search": req.enable_web_search, "model": model_choice,
+                         "session_id": session.session_id}
         }
     except Exception as e:
         logger.error(f"问答失败: {str(e)}")
         raise HTTPException(500, f"问答处理失败: {str(e)}") from e
 
 
+class AskStreamRequest(BaseModel):
+    question: str
+    session_id: Optional[str] = None
+    enable_web_search: bool = False
+    model_choice: Optional[str] = None
+
+
+def _format_sse(event):
+    """把事件字典序列化为 SSE 帧（P3.5）。"""
+    return f"event: {event['event']}\ndata: {json.dumps(event['data'], ensure_ascii=False)}\n\n"
+
+
+def _next_or_none(iterator):
+    try:
+        return next(iterator)
+    except StopIteration:
+        return None
+
+
+async def _sse_event_stream(request, payload):
+    """把 ``stream_answer_events`` 包装为带心跳与断连感知的 SSE 异步生成器（P3.4 / P3.6）。
+
+    - 逐条转发事件；两帧之间超过 ``SSE_HEARTBEAT_SEC`` 未产出时发送心跳注释帧；
+    - 客户端断连 → 记录日志并 ``close()`` 生成器（终止底层 LLM 流式调用，避免白付 token）；
+    - 正常完成（收到 ``done``）后把本轮写入会话历史（供 P3.2 / P3.3 使用）。
+    """
+    session = session_store.get_or_create(payload.session_id)
+    session_id = session.session_id
+    history = session.history()
+
+    generator = stream_answer_events(
+        payload.question, session_id=session_id, history=history,
+        enable_web_search=payload.enable_web_search,
+        model_choice=payload.model_choice or DEFAULT_MODEL_CHOICE,
+    )
+    retrieval_chunks = []
+    answer_parts = []
+    completed = False
+    disconnected = False
+    pending = None
+    try:
+        while True:
+            if pending is None:
+                pending = asyncio.ensure_future(asyncio.to_thread(_next_or_none, generator))
+            done, _ = await asyncio.wait({pending}, timeout=SSE_HEARTBEAT_SEC)
+            if not done:
+                yield ": heartbeat\n\n"
+                continue
+            event = pending.result()
+            pending = None
+            if event is None:
+                break
+            name = event["event"]
+            if name == "retrieval":
+                retrieval_chunks = event["data"].get("chunks", []) or []
+            elif name == "delta":
+                answer_parts.append(event["data"].get("text", ""))
+            elif name == "done":
+                completed = True
+            yield _format_sse(event)
+
+            if await request.is_disconnected():
+                disconnected = True
+                logger.info("客户端断连，终止 LLM 调用（session=%s）", session_id)
+                generator.close()
+                return
+    finally:
+        try:
+            generator.close()
+        except Exception:
+            pass
+        if not completed and not disconnected:
+            # 客户端中断 / 异常导致流提前结束：关闭生成器即终止底层 LLM 流式调用，避免白付 token。
+            logger.info("SSE 流提前终止（客户端断连或异常中断），已关闭生成器（session=%s）", session_id)
+
+    if completed:
+        answer_text = "".join(answer_parts)
+        cited = {int(number) for number in re.findall(r"\[(\d+)\]", answer_text)}
+        citations = [c for c in retrieval_chunks if c.get("index") in cited]
+        session_store.append_turn(session_id, payload.question, answer_text, citations)
+
+
+@app.post("/api/ask/stream")
+async def ask_stream(req: AskStreamRequest, request: Request):
+    """流式问答接口（SSE，P3.4）：事件顺序 ``retrieval`` → ``delta``* → ``citation`` → ``done``。"""
+    if not req.question:
+        raise HTTPException(400, "问题不能为空")
+    return StreamingResponse(
+        _sse_event_stream(request, req),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
+
+
+def _read_index_manifest():
+    """读取索引 manifest（P2.1）用于展示构建时间 / 参数；缺失或损坏时返回 {}（不抛错）。"""
+    path = os.path.join(INDEX_DIR, "manifest.json")
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except Exception:
+        return {}
+
+
+@app.get("/api/documents")
+async def get_documents():
+    """已入库文档列表与处理结果（§11.5 ``GET /api/documents``，P4.2）。"""
+    return {
+        "documents": list_documents(),
+        "total_chunks": vector_store.total_chunks,
+        "index_ready": vector_store.is_ready,
+    }
+
+
+@app.post("/api/kb/refresh")
+async def refresh_knowledge_base():
+    """扫描知识库目录（``config.DOCUMENTS_DIR``）并增量入库新增文档。
+
+    前端不再提供上传入口：用户把 PDF 放入知识库目录后，服务启动时或调用本接口即自动入库，
+    已有文档不会被清空或覆盖。返回 ``sync_documents`` 的逐文件结果与汇总。
+    """
+    try:
+        return await asyncio.to_thread(sync_documents)
+    except Exception as e:
+        logger.error("知识库同步失败: %s", e)
+        raise HTTPException(500, f"知识库同步失败: {e}") from e
+
+
 @app.get("/api/status")
 async def check_status():
+    """索引三态 + 模型信息（§11.5，P4.6）：所有取值来自真实运行态 / 真实 config。"""
+    manifest = _read_index_manifest()
+    # 索引三态以**当前运行态**为准：启动时加载成功后又被灌库（或本就加载成功）都应为 loaded。
+    index_status = INDEX_STATE.get("status")
+    index_message = INDEX_STATE.get("message")
+    if vector_store.is_ready:
+        index_status = "loaded"
+        if INDEX_STATE.get("status") != "loaded":
+            index_message = f"索引已就绪，共 {vector_store.total_chunks} 个文本块"
     return {
         "status": "healthy",
         "siliconflow_configured": is_configured_api_key(SILICONFLOW_API_KEY),
@@ -145,9 +280,21 @@ async def check_status():
         "vector_store_ready": vector_store.is_ready,
         "total_chunks": vector_store.total_chunks,
         "index_ready": vector_store.is_ready,
-        "index_status": INDEX_STATE.get("status"),
-        "index_message": INDEX_STATE.get("message"),
-        "version": __version__
+        "index_status": index_status,
+        "index_message": index_message,
+        # P4.6：索引文件路径 / 已索引文档数 / chunk 总数 / embedding 模型名 / 构建时间。
+        "index_dir": INDEX_DIR,
+        "index_built_at": manifest.get("built_at"),
+        "index_embedding_model": manifest.get("embedding_model"),
+        "indexed_documents": len(list_documents()) if vector_store.is_ready else 0,
+        "embedding_model": EMBED_MODEL_NAME,
+        "default_model": DEFAULT_MODEL_CHOICE,
+        "model_choices": [
+            {"value": value, "label": MODEL_DISPLAY_NAMES.get(value, value)}
+            for value in MODEL_CHOICES
+        ],
+        "models": get_system_models_info(),
+        "version": __version__,
     }
 
 

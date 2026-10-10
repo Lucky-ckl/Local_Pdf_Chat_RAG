@@ -140,6 +140,35 @@ class VectorStore:
         self.index = auto_index
         logging.info(f"FAISS 索引构建完成，共 {self.index.ntotal} 个文本块，类型: {auto_index.index_type}")
 
+    def add_index(self, chunks, chunk_ids, metadatas, embeddings):
+        """把新 chunk **追加**到现有索引（增量入库：不清空、不重建已有向量）。
+
+        与 ``build_index`` 的区别：保留已有的 contents / metadatas / id_order 与 FAISS 向量，
+        只追加本次新增的 chunk，使多个文档可以累计检索（知识库目录模式）。
+        索引为空时等价于 ``build_index``；已存在的 chunk_id 会被跳过，避免重复入库。
+        """
+        embeddings = np.asarray(embeddings, dtype="float32")
+        if not self.is_ready:
+            self.build_index(chunks, chunk_ids, metadatas, embeddings)
+            return
+        if embeddings.ndim != 2 or embeddings.shape[0] != len(chunks):
+            raise ValueError("增量索引：向量数量与 chunk 数量不一致")
+        if embeddings.shape[1] != self.index.dimension:
+            raise ValueError(
+                f"增量索引：向量维度 {embeddings.shape[1]} 与现有索引 {self.index.dimension} 不一致"
+            )
+        existing = set(self.contents_map)
+        new_positions = [i for i, chunk_id in enumerate(chunk_ids) if chunk_id not in existing]
+        if not new_positions:
+            logging.info("增量索引：本次没有新增 chunk")
+            return
+        for i in new_positions:
+            self.contents_map[chunk_ids[i]] = chunks[i]
+            self.metadatas_map[chunk_ids[i]] = metadatas[i]
+            self.id_order.append(chunk_ids[i])
+        self.index.add(embeddings[new_positions])
+        logging.info(f"增量索引追加完成，共 {self.index.ntotal} 个文本块")
+
     def search_with_scores(self, query_embedding, k=10):
         """
         搜索最相似的向量，并返回真实距离。
