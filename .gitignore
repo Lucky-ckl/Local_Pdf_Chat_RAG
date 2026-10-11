@@ -42,3 +42,8 @@ eval/index/
 eval/results/
 eval/corpus/
 eval/samples/*.pdf
+
+# 本地备份 / 私有草稿（含个人信息，不推送）
+config.py.backup
+*.backup
+.workbuddy/

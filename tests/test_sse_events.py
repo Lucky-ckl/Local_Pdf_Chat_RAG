@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import re
+import threading
 import time
 
 import pytest
@@ -329,3 +330,144 @@ def test_sse_emits_heartbeat_when_generation_stalls(monkeypatch):
     frames = asyncio.run(_collect(api_router._sse_event_stream(request, payload)))
 
     assert any(frame.startswith(": heartbeat") for frame in frames)
+
+
+# ── P3.4 卡死修复回归：上游不发 [DONE] / 不关闭连接时必须结束 ──────────────
+def test_stream_openai_api_interrupts_when_upstream_never_ends(monkeypatch):
+    """上游发若干 delta 后既不发 [DONE] 也不关闭连接 → 必须主动结束，不得永久阻塞。"""
+    monkeypatch.setattr(generator, "STREAM_IDLE_TIMEOUT_SEC", 0.2)
+
+    class _NeverEndingResponse:
+        def __init__(self):
+            self._closed = threading.Event()
+
+        def raise_for_status(self):
+            pass
+
+        def iter_lines(self):
+            yield b'data: ' + json.dumps(
+                {"choices": [{"delta": {"content": "部分"}, "finish_reason": None}]}
+            ).encode()
+            self._closed.wait()  # 永不发送 [DONE]、永不结束
+
+        def close(self):
+            self._closed.set()
+
+    monkeypatch.setattr(generator.requests, "post", lambda *a, **k: _NeverEndingResponse())
+
+    collected = []
+    with pytest.raises(TimeoutError):
+        for piece in generator._stream_openai_compatible_api(
+            "TestProvider", "key", "http://example/v1", "model", "prompt"
+        ):
+            collected.append(piece)
+    assert collected == ["部分"]
+
+
+def test_stream_openai_api_stops_on_finish_reason_without_done(monkeypatch):
+    """上游以 finish_reason 结束、不发 [DONE] → 正常收尾并保留已收到的增量。"""
+    monkeypatch.setattr(generator, "STREAM_IDLE_TIMEOUT_SEC", 5)
+    lines = [
+        b'data: ' + json.dumps(
+            {"choices": [{"delta": {"content": "你好"}, "finish_reason": None}]}
+        ).encode(),
+        b'data: ' + json.dumps(
+            {"choices": [{"delta": {}, "finish_reason": "stop"}]}
+        ).encode(),
+    ]
+
+    class _Response:
+        def raise_for_status(self):
+            pass
+
+        def iter_lines(self):
+            yield from lines
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(generator.requests, "post", lambda *a, **k: _Response())
+    assert list(generator._stream_openai_compatible_api(
+        "TestProvider", "key", "http://example/v1", "model", "prompt"
+    )) == ["你好"]
+
+
+def test_stream_openai_api_raises_on_error_frame(monkeypatch):
+    """流内返回 error 字段 → 记录日志并抛异常，不再静默丢弃。"""
+    monkeypatch.setattr(generator, "STREAM_IDLE_TIMEOUT_SEC", 5)
+    lines = [b'data: ' + json.dumps({"error": {"message": "boom"}}).encode()]
+
+    class _Response:
+        def raise_for_status(self):
+            pass
+
+        def iter_lines(self):
+            yield from lines
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(generator.requests, "post", lambda *a, **k: _Response())
+    with pytest.raises(RuntimeError):
+        list(generator._stream_openai_compatible_api(
+            "TestProvider", "key", "http://example/v1", "model", "prompt"
+        ))
+
+
+def test_stream_answer_events_emits_done_when_upstream_ends_on_finish_reason(monkeypatch):
+    """上游以 finish_reason 结束（无 [DONE]）时，事件序列仍以 citation → done 收尾。"""
+    monkeypatch.setattr(generator, "STREAM_IDLE_TIMEOUT_SEC", 5)
+    monkeypatch.setattr(generator, "vector_store", _DummyStore())
+    monkeypatch.setattr(generator, "recursive_retrieval", _fake_retrieval_recorder([_sample_chunk()]))
+    monkeypatch.setattr(generator, "SILICONFLOW_API_KEY", "test-key")
+    monkeypatch.setattr(generator, "SILICONFLOW_API_URL", "http://example/v1")
+
+    lines = [
+        b'data: ' + json.dumps(
+            {"choices": [{"delta": {"content": "答案 [0]"}, "finish_reason": None}]}
+        ).encode(),
+        b'data: ' + json.dumps(
+            {"choices": [{"delta": {}, "finish_reason": "stop"}]}
+        ).encode(),
+    ]
+
+    class _Response:
+        def raise_for_status(self):
+            pass
+
+        def iter_lines(self):
+            yield from lines
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(generator.requests, "post", lambda *a, **k: _Response())
+
+    events = list(generator.stream_answer_events("q"))
+    names = [event["event"] for event in events]
+    assert names[0] == "retrieval"
+    assert names[-2:] == ["citation", "done"]
+    assert "".join(e["data"]["text"] for e in events if e["event"] == "delta") == "答案 [0]"
+
+
+def test_sse_stream_times_out_instead_of_infinite_heartbeat(monkeypatch):
+    """底层长时间无事件时，SSE 必须下发 error 并结束连接，而非无限心跳。"""
+    monkeypatch.setattr(api_router, "SSE_HEARTBEAT_SEC", 0.02)
+    monkeypatch.setattr(api_router, "SSE_MAX_WAIT_SEC", 0.2)
+    api_router.session_store.clear()
+
+    def _stalling_events():
+        yield {"event": "retrieval", "data": {"chunks": []}}
+        yield {"event": "delta", "data": {"text": "部分回答"}}
+        time.sleep(0.5)  # 模拟底层被阻塞：长时间不再产出事件
+        yield {"event": "done", "data": {"session_id": "sess-timeout", "latency_ms": 1, "token_usage": None}}
+
+    monkeypatch.setattr(api_router, "stream_answer_events", lambda *a, **k: _stalling_events())
+    request = _FakeRequest(disconnect_after=None)
+    payload = api_router.AskStreamRequest(question="q", session_id="sess-timeout")
+    frames = asyncio.run(_collect(api_router._sse_event_stream(request, payload)))
+
+    assert any(frame.startswith("event: delta") for frame in frames)
+    assert any(frame.startswith("event: error") for frame in frames)
+    assert frames[-1].startswith("event: error")
+    assert api_router.session_store.history("sess-timeout") == []

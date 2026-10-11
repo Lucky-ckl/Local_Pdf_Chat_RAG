@@ -12,6 +12,7 @@ import json
 from typing import Dict, Any, List, Optional
 import logging
 import asyncio
+import time
 from contextlib import asynccontextmanager
 from version import __version__
 
@@ -35,6 +36,10 @@ logger.setLevel(logging.INFO)  # 显式设置，避免根 logger 级别（可能
 
 
 INDEX_STATE = {"status": "unknown", "message": "", "chunks": 0}
+
+# SSE 单流最大空闲等待（秒）：超过该时长仍无新事件则下发 error 并结束连接，避免无限心跳
+# （P3.4 卡死修复，作为底层 LLM 空闲超时之外的兜底）。可用环境变量覆盖。
+SSE_MAX_WAIT_SEC = float(os.getenv("SSE_MAX_WAIT_SEC", "120"))
 
 
 @asynccontextmanager
@@ -173,16 +178,25 @@ async def _sse_event_stream(request, payload):
     completed = False
     disconnected = False
     pending = None
+    last_event_at = time.monotonic()
     try:
         while True:
             if pending is None:
                 pending = asyncio.ensure_future(asyncio.to_thread(_next_or_none, generator))
             done, _ = await asyncio.wait({pending}, timeout=SSE_HEARTBEAT_SEC)
             if not done:
+                if time.monotonic() - last_event_at > SSE_MAX_WAIT_SEC:
+                    logger.error("SSE 流空闲超过 %.0fs，主动结束（session=%s）", SSE_MAX_WAIT_SEC, session_id)
+                    yield _format_sse({"event": "error", "data": {
+                        "code": "generation_timeout",
+                        "message": f"生成超时：超过 {SSE_MAX_WAIT_SEC:.0f} 秒未收到回答数据。",
+                    }})
+                    break
                 yield ": heartbeat\n\n"
                 continue
             event = pending.result()
             pending = None
+            last_event_at = time.monotonic()
             if event is None:
                 break
             name = event["event"]
@@ -200,10 +214,12 @@ async def _sse_event_stream(request, payload):
                 generator.close()
                 return
     finally:
+        if pending is not None and not pending.done():
+            pending.cancel()
         try:
             generator.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("关闭 SSE 生成器失败（session=%s）：%s", session_id, exc)
         if not completed and not disconnected:
             # 客户端中断 / 异常导致流提前结束：关闭生成器即终止底层 LLM 流式调用，避免白付 token。
             logger.info("SSE 流提前终止（客户端断连或异常中断），已关闭生成器（session=%s）", session_id)

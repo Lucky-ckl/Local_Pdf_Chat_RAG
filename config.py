@@ -47,7 +47,7 @@ MAGICK_API_URL = os.getenv(
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 OLLAMA_MODEL_NAME = os.getenv("OLLAMA_MODEL_NAME", "deepseek-r1:8b")
 SILICONFLOW_MODEL_NAME = os.getenv("SILICONFLOW_MODEL_NAME", "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B")
-MAGICK_MODEL_NAME = os.getenv("MAGICK_MODEL_NAME", "gpt-4o-mini")
+MAGICK_MODEL_NAME = os.getenv("MAGICK_MODEL_NAME", "deepseek-v4.1-flash")
 RERANK_METHOD = os.getenv("RERANK_METHOD", "cross_encoder")
 # 交叉编码器模型名（P1.2；仅 RERANK_METHOD=cross_encoder 时生效）。
 # 默认 BAAI/bge-reranker-v2-m3：中文友好，且与 P5 评测实际使用的模型一致（本机离线可加载）。
@@ -117,7 +117,7 @@ def choose_default_model(siliconflow_key, magick_key, ollama_available=False):
 CHUNK_SIZE = _env_int("CHUNK_SIZE", 400)          # 文本分块大小（字符数）
 CHUNK_OVERLAP = _env_int("CHUNK_OVERLAP", 40)     # 相邻分块的重叠字符数
 HYBRID_ALPHA = _env_float("HYBRID_ALPHA", 0.7)    # 混合检索中语义检索的权重（0-1）
-RETRIEVAL_TOP_K = _env_int("RETRIEVAL_TOP_K", 10)  # 检索返回的候选文档数量
+RETRIEVAL_TOP_K = _env_int("RETRIEVAL_TOP_K", 20)  # 检索返回的候选文档数量
 RERANK_TOP_K = _env_int("RERANK_TOP_K", 5)        # 重排序后保留的文档数量
 MAX_RETRIEVAL_ITERATIONS = _env_int("MAX_RETRIEVAL_ITERATIONS", 3)  # 递归检索的最大迭代轮数
 
@@ -132,6 +132,11 @@ INDEX_DIR = os.getenv("INDEX_DIR", "data/index/")   # 索引持久化目录
 DOCUMENTS_DIR = os.getenv("DOCUMENTS_DIR", "data/documents/")  # 知识库文档目录（前端不提供上传，改为扫描此目录）
 SESSION_MAX_TURNS = _env_int("SESSION_MAX_TURNS", 5)  # 多轮保留轮数
 SSE_HEARTBEAT_SEC = _env_int("SSE_HEARTBEAT_SEC", 15)  # 流式心跳间隔（秒）
+
+# LLM 云端接口 TLS 校验：身处企业代理 / 杀软 HTTPS 拦截（自签名证书）环境时，
+# 优先用 LLM_CA_BUNDLE 指向拦截根证书；万不得已再设 LLM_SSL_VERIFY=false 关闭校验。
+LLM_SSL_VERIFY = _env_bool("LLM_SSL_VERIFY", True)   # 默认开启证书校验
+LLM_CA_BUNDLE = os.getenv("LLM_CA_BUNDLE", "").strip()  # 自定义 CA 证书路径（可选，优先于开关）
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 第五步：运行时环境配置

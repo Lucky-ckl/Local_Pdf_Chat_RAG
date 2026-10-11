@@ -9,19 +9,33 @@ LLM 调用 —— 大模型回答生成（Ollama + SiliconFlow + Magick API）
 
 import json
 import logging
+import os
 import re
+import threading
 import time
 import requests
 from config import (
     SILICONFLOW_API_KEY, SILICONFLOW_API_URL,
     SILICONFLOW_MODEL_NAME, OLLAMA_MODEL_NAME,
-    MAGICK_API_KEY, MAGICK_API_URL, MAGICK_MODEL_NAME
+    MAGICK_API_KEY, MAGICK_API_URL, MAGICK_MODEL_NAME,
+    LLM_SSL_VERIFY, LLM_CA_BUNDLE
 )
 from utils.network import get_session
 from core.retriever import recursive_retrieval, _history_turns
 from core.vector_store import vector_store
 from features.conflict_detector import detect_conflicts, evaluate_source_credibility
 from features.thinking_chain import process_thinking_content
+
+# 流式响应最大空闲秒数（P3.4 卡死修复）：超过该时长未收到任何有效数据分片，则主动关闭底层
+# 请求并抛 TimeoutError，避免上游不发 [DONE] / 不关闭连接时永久阻塞。可用环境变量覆盖。
+STREAM_IDLE_TIMEOUT_SEC = float(os.getenv("STREAM_IDLE_TIMEOUT_SEC", "60"))
+
+
+def _llm_verify():
+    """LLM 云端接口 TLS 校验参数：优先自定义 CA，其次布尔开关（默认开启校验）。"""
+    if LLM_CA_BUNDLE:
+        return LLM_CA_BUNDLE
+    return LLM_SSL_VERIFY
 
 
 def _normalize_chat_completions_url(api_url):
@@ -81,7 +95,8 @@ def _call_openai_compatible_api(provider_name, api_key, api_url, model_name,
             "Content-Type": "application/json; charset=utf-8"
         }
         json_payload = json.dumps(payload, ensure_ascii=False).encode('utf-8')
-        response = requests.post(chat_url, data=json_payload, headers=headers, timeout=180)
+        response = requests.post(chat_url, data=json_payload, headers=headers, timeout=180,
+                                 verify=_llm_verify())
         response.raise_for_status()
         result = response.json()
         return _extract_openai_compatible_content(result)
@@ -328,7 +343,7 @@ def query_answer(question, enable_web_search=False, model_choice="siliconflow", 
             progress(0.8, desc="生成回答...")
 
         if model_choice in ("siliconflow", "magick"):
-            result = call_cloud_api(prompt, model_choice, temperature=0.7, max_tokens=1536)
+            result = call_cloud_api(prompt, model_choice, temperature=0.7, max_tokens=4096)
         elif model_choice == "ollama":
             response = get_session().post(
                 "http://localhost:11434/api/generate",
@@ -349,12 +364,16 @@ def query_answer(question, enable_web_search=False, model_choice="siliconflow", 
 
 
 def _stream_openai_compatible_api(provider_name, api_key, api_url, model_name, prompt,
-                                  temperature=0.7, max_tokens=1536, extra_payload=None):
+                                  temperature=0.7, max_tokens=4096, extra_payload=None):
     """流式调用 OpenAI-compatible Chat Completions（``stream=True``，P3.4）。
 
     逐片 yield 正文增量；缺少 Key / URL 或 HTTP 错误时抛异常（由上层转为 ``error`` 事件）。
     与 ``_call_openai_compatible_api``（非流式）区分：本函数真正启用服务端流式，修复旧
     ``stream_answer`` 云端分支写死 ``"stream": False``、整体生成后一次 yield 的问题（缺陷 D3）。
+
+    P3.4 卡死修复：满足任一条件即结束读取——``data: [DONE]``、``choices[0].finish_reason``
+    非空、上游关闭连接、或超过 ``STREAM_IDLE_TIMEOUT_SEC`` 秒未收到有效分片；返回 ``error``
+    字段时记录日志并抛异常，不再静默 ``continue``；底层响应始终 ``close()``。
     """
     if not api_key:
         raise RuntimeError(f"未配置 {provider_name} API Key")
@@ -375,27 +394,75 @@ def _stream_openai_compatible_api(provider_name, api_key, api_url, model_name, p
         "Authorization": f"Bearer {api_key.strip()}",
         "Content-Type": "application/json; charset=utf-8",
     }
-    response = requests.post(chat_url, json=payload, headers=headers, timeout=180, stream=True)
-    response.raise_for_status()
-    for raw_line in response.iter_lines():
-        if not raw_line:
-            continue
-        line = raw_line.decode("utf-8").strip()
-        if not line.startswith("data:"):
-            continue
-        data = line[len("data:"):].strip()
-        if data == "[DONE]":
-            break
+    response = requests.post(
+        chat_url, json=payload, headers=headers,
+        timeout=(10, STREAM_IDLE_TIMEOUT_SEC), stream=True,
+        verify=_llm_verify(),
+    )
+
+    idle_state = {"fired": False}
+    last_progress = {"at": time.monotonic()}
+    stop_watchdog = threading.Event()
+
+    def _watchdog():
+        # 后台看门狗：长时间收不到有效分片时主动关闭响应，解除 iter_lines() 的阻塞。
+        while not stop_watchdog.wait(0.5):
+            if time.monotonic() - last_progress["at"] > STREAM_IDLE_TIMEOUT_SEC:
+                idle_state["fired"] = True
+                logging.error("%s 流式响应空闲超过 %.0fs，主动中断", provider_name, STREAM_IDLE_TIMEOUT_SEC)
+                try:
+                    response.close()
+                except Exception as exc:
+                    logging.warning("关闭 %s 流式响应失败：%s", provider_name, exc)
+                return
+
+    watchdog = threading.Thread(target=_watchdog, name="llm-stream-watchdog", daemon=True)
+    watchdog.start()
+    try:
+        response.raise_for_status()
+        for raw_line in response.iter_lines():
+            if not raw_line:
+                continue
+            line = raw_line.decode("utf-8").strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[len("data:"):].strip()
+            if data == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data)
+            except json.JSONDecodeError:
+                logging.warning("%s 返回无法解析的流式分片：%s", provider_name, data[:200])
+                continue
+            if isinstance(chunk, dict) and chunk.get("error"):
+                logging.error("%s 流式接口返回错误：%s", provider_name, chunk["error"])
+                raise RuntimeError(f"{provider_name} 流式接口返回错误：{chunk['error']}")
+            choices = chunk.get("choices") or []
+            if not choices:
+                logging.warning("%s 返回缺少 choices 的流式分片：%s", provider_name, data[:200])
+                continue
+            last_progress["at"] = time.monotonic()
+            choice = choices[0]
+            text = (choice.get("delta") or {}).get("content")
+            if text:
+                yield text
+            if choice.get("finish_reason"):
+                break
+    except Exception as exc:
+        if idle_state["fired"]:
+            raise TimeoutError(
+                f"{provider_name} 流式响应空闲超过 {STREAM_IDLE_TIMEOUT_SEC}s，已中断"
+            ) from exc
+        raise
+    finally:
+        stop_watchdog.set()
         try:
-            chunk = json.loads(data)
-        except json.JSONDecodeError:
-            continue
-        choices = chunk.get("choices") or []
-        if not choices:
-            continue
-        text = (choices[0].get("delta") or {}).get("content")
-        if text:
-            yield text
+            response.close()
+        except Exception as exc:
+            logging.warning("关闭 %s 流式响应失败：%s", provider_name, exc)
+
+    if idle_state["fired"]:
+        raise TimeoutError(f"{provider_name} 流式响应空闲超过 {STREAM_IDLE_TIMEOUT_SEC}s，已中断")
 
 
 def _stream_llm(prompt, model_choice="siliconflow"):
