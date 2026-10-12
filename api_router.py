@@ -42,6 +42,22 @@ INDEX_STATE = {"status": "unknown", "message": "", "chunks": 0}
 SSE_MAX_WAIT_SEC = float(os.getenv("SSE_MAX_WAIT_SEC", "120"))
 
 
+# 后台知识库同步任务：持有强引用避免被垃圾回收，关闭时用于取消。
+_background_tasks: set = set()
+
+
+async def _run_kb_sync():
+    """后台执行知识库增量同步：失败只记日志，不影响 API 启动与后续运行。"""
+    try:
+        summary = await asyncio.to_thread(sync_documents)
+        logger.info("知识库同步: %s", summary.get("message"))
+    except asyncio.CancelledError:
+        logger.info("知识库同步任务已取消（服务关闭）")
+        raise
+    except Exception as e:
+        logger.error("后台同步知识库失败: %s", e, exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("API 服务启动")
@@ -50,12 +66,19 @@ async def lifespan(app: FastAPI):
     INDEX_STATE = load_persisted_index()
     logger.info("索引状态: %s - %s", INDEX_STATE.get("status"), INDEX_STATE.get("message"))
     # 知识库目录同步：扫描 data/documents，把新增文档增量入库（不清空已有文档）。
-    try:
-        summary = await asyncio.to_thread(sync_documents)
-        logger.info("知识库同步: %s", summary.get("message"))
-    except Exception as e:
-        logger.error("启动时同步知识库失败: %s", e)
+    # 改为后台任务：API 先启动完成（立即打印 Application startup complete），
+    # 大量 PDF/OCR 的解析与入库在后台线程进行，不再阻塞启动。
+    task = asyncio.create_task(_run_kb_sync())
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
     yield
+    # 关闭时取消仍在进行的同步任务，不等待其完成（OCR 计算线程无法中断，仅停止等待）。
+    if not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
     logger.info("API 服务已关闭")
 
 

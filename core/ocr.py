@@ -61,29 +61,105 @@ class RenderedPage:
 # ── OCR 引擎：懒加载 + 缓存（P2.3）────────────────────────────────────
 _ENGINE = None
 _FIRST_CALL_DONE = False
+_PROVIDER = None  # 引擎实际生效的 ONNX Runtime provider："CUDA" / "CPU"
+
+
+def _cuda_provider_available():
+    """onnxruntime 是否提供 CUDA Execution Provider（需安装 onnxruntime-gpu）。"""
+    try:
+        import onnxruntime
+        return "CUDAExecutionProvider" in onnxruntime.get_available_providers()
+    except Exception:
+        return False
+
+
+def _build_engine(use_cuda):
+    """构造 RapidOCR 引擎；``use_cuda=True`` 时要求 det/rec/cls 三个会话优先走 CUDA。"""
+    from rapidocr_onnxruntime import RapidOCR
+    if use_cuda:
+        return RapidOCR(det_use_cuda=True, rec_use_cuda=True, cls_use_cuda=True)
+    return RapidOCR()
+
+
+def _engine_provider(engine):
+    """读取引擎三个会话实际生效的 provider；任一走 CUDA 即视为 CUDA，无法判定返回 None。"""
+    for infer in (getattr(engine, "text_det", None), getattr(engine, "text_rec", None),
+                  getattr(engine, "text_cls", None)):
+        session = getattr(infer, "infer", None) or getattr(infer, "session", None)
+        try:
+            providers = session.session.get_providers()
+        except Exception:
+            continue
+        if providers and providers[0] == "CUDAExecutionProvider":
+            return "CUDA"
+    return None
+
+
+def _preload_onnxruntime_dlls():
+    """在构造引擎前预加载 ONNX Runtime 依赖的 CUDA/cuDNN DLL。
+
+    RapidOCR 自身不会调用 preload，导致 ``onnxruntime_providers_cuda`` 找不到
+    ``site-packages/nvidia/*/bin`` 下的 DLL 而静默回退 CPU。这里统一预加载；
+    非 GPU 环境、缺少该 API 或加载失败时均告警跳过，绝不阻断启动。
+    """
+    try:
+        import onnxruntime as ort
+        if hasattr(ort, "preload_dlls"):
+            ort.preload_dlls()
+    except Exception as exc:
+        logger.warning("ONNX Runtime DLL preload 失败（忽略，继续初始化）：%s", exc)
 
 
 def _get_engine():
-    """懒加载并缓存 RapidOCR 引擎实例，避免每次调用重新初始化。"""
-    global _ENGINE
+    """懒加载并缓存 RapidOCR 引擎实例，避免每次调用重新初始化。
+
+    优先使用 GPU（CUDA Execution Provider）；不可用或初始化失败时自动回退 CPU，
+    并打印实际生效的 provider（``OCR Provider: CUDA`` / ``OCR Provider: CPU``）。
+    """
+    global _ENGINE, _PROVIDER
     if _ENGINE is not None:
         return _ENGINE
     engine_name = getattr(config, "OCR_ENGINE", "rapidocr")
     if engine_name != "rapidocr":
         raise ValueError(f"不支持的 OCR_ENGINE={engine_name!r}（WBS 仅规定 rapidocr）")
     init_started = time.perf_counter()
-    from rapidocr_onnxruntime import RapidOCR
+    _preload_onnxruntime_dlls()
 
-    _ENGINE = RapidOCR()
+    if _cuda_provider_available():
+        try:
+            candidate = _build_engine(use_cuda=True)
+            _ENGINE = candidate
+            _PROVIDER = _engine_provider(candidate)
+            if _PROVIDER != "CUDA":
+                logger.warning(
+                    "onnxruntime-gpu installed but execution fallback to CPU"
+                    "（RapidOCR 会话未启用 CUDAExecutionProvider）"
+                )
+                _PROVIDER = "CPU"
+        except Exception as exc:
+            logger.warning("CUDA OCR 引擎初始化失败，回退 CPU：%s", exc)
+            _ENGINE = None
+
+    if _ENGINE is None:
+        _ENGINE = _build_engine(use_cuda=False)
+        _PROVIDER = _engine_provider(_ENGINE) or "CPU"
+
+    logger.info("OCR Provider: %s", _PROVIDER)
     logger.info("RapidOCR 引擎初始化完成，耗时 %.3fs", time.perf_counter() - init_started)
     return _ENGINE
 
 
+def get_engine_provider():
+    """返回引擎已生效的 provider（"CUDA" / "CPU"）；引擎未初始化时返回 None。"""
+    return _PROVIDER
+
+
 def reset_engine():
     """清空缓存的引擎实例（供测试或显式重载使用）。"""
-    global _ENGINE, _FIRST_CALL_DONE
+    global _ENGINE, _FIRST_CALL_DONE, _PROVIDER
     _ENGINE = None
     _FIRST_CALL_DONE = False
+    _PROVIDER = None
 
 
 def _box_to_rect(box):

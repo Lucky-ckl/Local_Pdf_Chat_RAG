@@ -70,6 +70,148 @@ def test_engine_is_lazy_loaded_and_cached(monkeypatch):
     assert created["count"] == 1  # 缓存复用：仅初始化一次
 
 
+def test_engine_prefers_cuda_provider_when_available(monkeypatch, caplog):
+    """CUDA 可用时：以 use_cuda=True 构造引擎，并记录 OCR Provider: CUDA。"""
+    import rapidocr_onnxruntime
+
+    seen = {}
+
+    class _Session:
+        def get_providers(self):
+            return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+    class _Backend:
+        def __init__(self):
+            self.session = _Session()
+
+    class _Infer:
+        def __init__(self):
+            self.infer = _Backend()
+
+    class _FakeRapidOCR:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+            self.text_det = _Infer()
+            self.text_rec = _Infer()
+            self.text_cls = _Infer()
+
+        def __call__(self, image):
+            return (None, [0.0, 0.0, 0.0])
+
+    monkeypatch.setattr(rapidocr_onnxruntime, "RapidOCR", _FakeRapidOCR)
+    monkeypatch.setattr(ocr, "_cuda_provider_available", lambda: True)
+
+    with caplog.at_level(logging.INFO, logger="core.ocr"):
+        ocr.ocr_image(object())
+
+    assert seen == {"det_use_cuda": True, "rec_use_cuda": True, "cls_use_cuda": True}
+    assert ocr.get_engine_provider() == "CUDA"
+    assert any("OCR Provider: CUDA" in r.getMessage() for r in caplog.records)
+
+
+def test_engine_falls_back_to_cpu_when_cuda_init_fails(monkeypatch, caplog):
+    """CUDA 可用但初始化抛错时：自动回退 CPU，并记录 OCR Provider: CPU。"""
+    import rapidocr_onnxruntime
+
+    calls = []
+
+    class _FakeRapidOCR:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+            if kwargs:
+                raise RuntimeError("CUDA runtime not found")
+
+        def __call__(self, image):
+            return (None, [0.0, 0.0, 0.0])
+
+    monkeypatch.setattr(rapidocr_onnxruntime, "RapidOCR", _FakeRapidOCR)
+    monkeypatch.setattr(ocr, "_cuda_provider_available", lambda: True)
+
+    with caplog.at_level(logging.INFO, logger="core.ocr"):
+        ocr.ocr_image(object())
+
+    assert calls == [{"det_use_cuda": True, "rec_use_cuda": True, "cls_use_cuda": True}, {}]
+    assert ocr.get_engine_provider() == "CPU"
+    assert any("OCR Provider: CPU" in r.getMessage() for r in caplog.records)
+
+
+def test_engine_uses_cpu_when_cuda_provider_missing(monkeypatch, caplog):
+    """无 CUDA Provider 时：直接走 CPU，并记录 OCR Provider: CPU。"""
+    import rapidocr_onnxruntime
+
+    class _FakeRapidOCR:
+        def __call__(self, image):
+            return (None, [0.0, 0.0, 0.0])
+
+    monkeypatch.setattr(rapidocr_onnxruntime, "RapidOCR", _FakeRapidOCR)
+    monkeypatch.setattr(ocr, "_cuda_provider_available", lambda: False)
+
+    with caplog.at_level(logging.INFO, logger="core.ocr"):
+        ocr.ocr_image(object())
+
+    assert ocr.get_engine_provider() == "CPU"
+    assert any("OCR Provider: CPU" in r.getMessage() for r in caplog.records)
+
+
+def test_engine_reports_cpu_when_cuda_session_falls_back(monkeypatch, caplog):
+    """CUDA provider 可用但会话实际回退 CPU：不得误报 CUDA，须记 CPU 并告警。"""
+    import rapidocr_onnxruntime
+
+    class _Session:
+        def get_providers(self):
+            return ["CPUExecutionProvider"]
+
+    class _Backend:
+        def __init__(self):
+            self.session = _Session()
+
+    class _Infer:
+        def __init__(self):
+            self.infer = _Backend()
+
+    class _FakeRapidOCR:
+        def __init__(self, **kwargs):
+            self.text_det = _Infer()
+            self.text_rec = _Infer()
+            self.text_cls = _Infer()
+
+        def __call__(self, image):
+            return (None, [0.0, 0.0, 0.0])
+
+    monkeypatch.setattr(rapidocr_onnxruntime, "RapidOCR", _FakeRapidOCR)
+    monkeypatch.setattr(ocr, "_cuda_provider_available", lambda: True)
+
+    with caplog.at_level(logging.INFO, logger="core.ocr"):
+        ocr.ocr_image(object())
+
+    assert ocr.get_engine_provider() == "CPU"
+    assert any("OCR Provider: CPU" in r.getMessage() for r in caplog.records)
+    assert any("fallback to CPU" in r.getMessage() for r in caplog.records)
+
+
+def test_preload_failure_does_not_block_engine_init(monkeypatch, caplog):
+    """preload_dlls 抛错时不得阻断引擎初始化（无 GPU 或环境损坏仍可运行）。"""
+    import onnxruntime
+    import rapidocr_onnxruntime
+
+    def _boom():
+        raise RuntimeError("preload boom")
+
+    class _FakeRapidOCR:
+        def __call__(self, image):
+            return (None, [0.0, 0.0, 0.0])
+
+    monkeypatch.setattr(onnxruntime, "preload_dlls", _boom, raising=False)
+    monkeypatch.setattr(rapidocr_onnxruntime, "RapidOCR", _FakeRapidOCR)
+    monkeypatch.setattr(ocr, "_cuda_provider_available", lambda: False)
+
+    with caplog.at_level(logging.WARNING, logger="core.ocr"):
+        ocr.ocr_image(object())
+
+    assert ocr.get_engine_provider() == "CPU"
+    assert any("preload" in r.getMessage() for r in caplog.records)
+
+
 def test_ocr_image_orders_lines_and_reports_engine(monkeypatch):
     import rapidocr_onnxruntime
 
